@@ -144,12 +144,16 @@ async def test_token_is_cached_until_shortly_before_expiry(expires_in, refresh_a
 
 
 @pytest.mark.asyncio
-async def test_distinct_configs_get_distinct_tokens():
+@pytest.mark.parametrize(
+    "field, other",
+    [("client_id", "b"), ("token_url", "https://other-idp.example.com/token"), ("scope", "other-scope")],
+)
+async def test_distinct_configs_get_distinct_tokens(field, other):
     idp = _IdP()
     hook = idp.hook()
-    first = await _run(hook, h2o_oauth=_config(client_id="a"))
-    second = await _run(hook, h2o_oauth=_config(client_id="b"))
-    again = await _run(hook, h2o_oauth=_config(client_id="a"))
+    first = await _run(hook, h2o_oauth=_config())
+    second = await _run(hook, h2o_oauth=_config(**{field: other}))
+    again = await _run(hook, h2o_oauth=_config())
     assert (first["api_key"], second["api_key"], again["api_key"]) == ("tok-1", "tok-2", "tok-1")
 
 
