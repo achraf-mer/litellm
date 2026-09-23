@@ -284,6 +284,10 @@ _BANNED_REQUEST_BODY_PARAMS: Tuple[str, ...] = (
     # the request away from the admin's pinned configuration.
     "nvcf_function_id",
     "use_ssl",
+    "ssl_verify",
+    "client_cert",
+    "client_key",
+    "h2o_oauth",
     # SDK-only field; also rejected outright in is_request_body_safe.
     "model_list",
     # Observability credentials, hosts, and project identifiers: derived
