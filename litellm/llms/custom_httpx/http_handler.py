@@ -343,6 +343,28 @@ def get_ssl_configuration(
     return ssl_verify
 
 
+def get_client_cert_ssl_context(
+    ssl_verify: Optional[VerifyTypes],
+    client_cert: str,
+    client_key: Optional[str] = None,
+) -> ssl.SSLContext:
+    if isinstance(ssl_verify, ssl.SSLContext):
+        raise ValueError("client_cert cannot be combined with an ssl.SSLContext ssl_verify; pass a CA bundle path")
+    resolved_verify = get_ssl_verify(ssl_verify)
+    if resolved_verify is False:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    else:
+        context = _create_ssl_context(
+            cafile=resolved_verify if isinstance(resolved_verify, str) else certifi.where(),
+            ssl_security_level=os.getenv("SSL_SECURITY_LEVEL", litellm.ssl_security_level),
+            ssl_ecdh_curve=os.getenv("SSL_ECDH_CURVE", litellm.ssl_ecdh_curve),
+        )
+    context.load_cert_chain(certfile=client_cert, keyfile=client_key)
+    return context
+
+
 _shared_realtime_ssl_context: Optional[Union[bool, str, ssl.SSLContext]] = None
 
 

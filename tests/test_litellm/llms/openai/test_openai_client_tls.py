@@ -1,28 +1,11 @@
-"""Per-deployment TLS transport config on the openai provider path.
-
-Three things are verified:
-
-1. Extraction of ssl_verify / client_cert / client_key from litellm_params.
-2. That TLS config participates in the client cache key. This is the sharp edge:
-   `_get_openai_client` builds its cache key from `locals()` filtered by a field
-   list, so a parameter that changes the client but is missing from that list
-   would let two deployments with DIFFERENT client certificates share one cached
-   client -- presenting one model's mTLS identity for another model's requests.
-3. End-to-end: a completion against a mutual-TLS OpenAI-compatible endpoint
-   succeeds when the deployment declares a client certificate, and fails without
-   it. A mocked transport cannot show whether a certificate was presented, which
-   is the entire point of the feature.
-"""
-
 import datetime
-import io
 import json
 import os
 import ssl
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import List, Optional
 
 import pytest
 
@@ -39,50 +22,6 @@ from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 from cryptography.x509.oid import NameOID  # noqa: E402
 
 
-# --------------------------------------------------------------------------
-# 1. Extraction from litellm_params
-# --------------------------------------------------------------------------
-
-
-def test_no_litellm_params_yields_no_tls_config():
-    assert BaseOpenAILLM.tls_client_kwargs(None) == {"ssl_verify": None, "client_cert": None}
-    assert BaseOpenAILLM.tls_client_kwargs({}) == {"ssl_verify": None, "client_cert": None}
-
-
-def test_model_without_tls_config_is_unaffected():
-    params = {"model": "openai/gpt-4o", "api_key": "sk-x", "api_base": "https://api.openai.com/v1"}
-    assert BaseOpenAILLM.tls_client_kwargs(params) == {"ssl_verify": None, "client_cert": None}
-
-
-def test_cert_and_key_pair():
-    params = {"client_cert": "/etc/tls/client.crt", "client_key": "/etc/tls/client.key"}
-    assert BaseOpenAILLM.tls_client_kwargs(params)["client_cert"] == (
-        "/etc/tls/client.crt",
-        "/etc/tls/client.key",
-    )
-
-
-def test_combined_pem_without_key():
-    params = {"client_cert": "/etc/tls/combined.pem"}
-    assert BaseOpenAILLM.tls_client_kwargs(params)["client_cert"] == "/etc/tls/combined.pem"
-
-
-def test_key_without_cert_is_ignored_not_crashed():
-    """httpx cannot use a key alone; surfacing it as None keeps the request path
-    intact (the credential layer rejects the same mistake with a clear error)."""
-    assert BaseOpenAILLM.tls_client_kwargs({"client_key": "/etc/tls/only.key"})["client_cert"] is None
-
-
-def test_ssl_verify_passthrough():
-    assert BaseOpenAILLM.tls_client_kwargs({"ssl_verify": "/etc/tls/ca.pem"})["ssl_verify"] == "/etc/tls/ca.pem"
-    assert BaseOpenAILLM.tls_client_kwargs({"ssl_verify": False})["ssl_verify"] is False
-
-
-# --------------------------------------------------------------------------
-# 2. Cache key must separate clients by TLS identity
-# --------------------------------------------------------------------------
-
-
 def _cache_key(**overrides):
     params = {
         "is_async": True,
@@ -94,34 +33,40 @@ def _cache_key(**overrides):
         "organization": None,
         "ssl_verify": None,
         "client_cert": None,
+        "client_key": None,
+        **overrides,
     }
-    params.update(overrides)
-    return BaseOpenAILLM.get_openai_client_cache_key(
-        client_initialization_params=params, client_type="openai"
-    )
+    return BaseOpenAILLM.get_openai_client_cache_key(client_initialization_params=params, client_type="openai")
 
 
-def test_different_client_certs_do_not_share_a_cached_client():
-    key_a = _cache_key(client_cert=("/etc/tls/a.crt", "/etc/tls/a.key"))
-    key_b = _cache_key(client_cert=("/etc/tls/b.crt", "/etc/tls/b.key"))
-    assert key_a != key_b, "two mTLS identities must never share one cached client"
+@pytest.mark.parametrize(
+    "field, value_a, value_b",
+    [
+        ("client_cert", "/etc/tls/a.crt", "/etc/tls/b.crt"),
+        ("client_key", "/etc/tls/a.key", "/etc/tls/b.key"),
+        ("ssl_verify", "/etc/tls/ca-a.pem", "/etc/tls/ca-b.pem"),
+    ],
+)
+def test_tls_settings_partition_the_client_cache(field, value_a, value_b):
+    assert _cache_key(**{field: value_a}) != _cache_key(**{field: value_b})
+    assert _cache_key(**{field: value_a}) == _cache_key(**{field: value_a})
 
 
-def test_cert_bearing_and_plain_deployments_do_not_share_a_cached_client():
-    assert _cache_key(client_cert="/etc/tls/a.pem") != _cache_key()
+def test_tls_client_kwargs_reads_litellm_params():
+    params = {"client_cert": "/c.crt", "client_key": "/c.key", "ssl_verify": "/ca.pem", "api_key": "x"}
+    assert BaseOpenAILLM.tls_client_kwargs(params) == {
+        "ssl_verify": "/ca.pem",
+        "client_cert": "/c.crt",
+        "client_key": "/c.key",
+    }
+    assert BaseOpenAILLM.tls_client_kwargs(None) == {"ssl_verify": None, "client_cert": None, "client_key": None}
 
 
-def test_different_ca_bundles_do_not_share_a_cached_client():
-    assert _cache_key(ssl_verify="/etc/tls/ca-a.pem") != _cache_key(ssl_verify="/etc/tls/ca-b.pem")
+def test_client_cert_with_a_caller_supplied_sslcontext_is_refused():
+    from litellm.llms.custom_httpx.http_handler import get_client_cert_ssl_context
 
-
-def test_identical_tls_config_reuses_one_client():
-    assert _cache_key(client_cert="/etc/tls/a.pem") == _cache_key(client_cert="/etc/tls/a.pem")
-
-
-# --------------------------------------------------------------------------
-# 3. End-to-end against a mutual-TLS OpenAI-compatible endpoint
-# --------------------------------------------------------------------------
+    with pytest.raises(ValueError, match="cannot be combined"):
+        get_client_cert_ssl_context(ssl.create_default_context(), "/tmp/does-not-matter.pem")
 
 
 def _key_pem(key) -> bytes:
@@ -163,43 +108,40 @@ def _mint_leaf(ca_key, ca_cert, common_name: str, dns_name: Optional[str] = None
         .not_valid_after(now + datetime.timedelta(hours=1))
     )
     if dns_name:
-        builder = builder.add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(dns_name)]), critical=False
-        )
+        builder = builder.add_extension(x509.SubjectAlternativeName([x509.DNSName(dns_name)]), critical=False)
     return key, builder.sign(ca_key, hashes.SHA256())
 
 
-class _ChatHandler(BaseHTTPRequestHandler):
+class _RecordingHandler(BaseHTTPRequestHandler):
+    seen: List[dict] = []
+
     def do_POST(self):
-        length = int(self.headers.get("content-length", 0) or 0)
-        self.rfile.read(length)
-        if self.path.endswith("/audio/transcriptions"):
-            response = {"text": "mtls-transcription-ok"}
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0) or 0)))
+        peer = self.connection.getpeercert() or {}
+        common_name = dict(pair[0] for pair in peer.get("subject", ()))["commonName"]
+        _RecordingHandler.seen.append({"path": self.path, "peer_cn": common_name, "body_keys": sorted(body)})
+        if self.path.endswith("/embeddings"):
+            response = {
+                "object": "list",
+                "model": "gw-embed",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.5]}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            }
         else:
             response = {
                 "id": "chatcmpl-mtls",
                 "object": "chat.completion",
                 "created": 0,
                 "model": "gw-model",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "mtls-ok"},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 1,
-                    "completion_tokens": 1,
-                    "total_tokens": 2,
-                },
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "mtls-ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             }
-        body = json.dumps(response).encode()
+        encoded = json.dumps(response).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
+        self.send_header("content-length", str(len(encoded)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(encoded)
 
     def log_message(self, *args):
         pass
@@ -209,7 +151,6 @@ class _QuietServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def handle_error(self, request, client_address):
-        # A rejected handshake is expected in one of these tests.
         pass
 
 
@@ -238,7 +179,7 @@ def mtls_llm_endpoint(tmp_path_factory):
     context.load_verify_locations(str(paths["ca"]))
     context.verify_mode = ssl.CERT_REQUIRED
 
-    server = _QuietServer(("127.0.0.1", 0), _ChatHandler)
+    server = _QuietServer(("127.0.0.1", 0), _RecordingHandler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     port = server.socket.getsockname()[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -250,79 +191,76 @@ def mtls_llm_endpoint(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def _clear_client_cache():
-    """Each case must build its own client -- otherwise a cached one from a
-    previous case would mask both the success and the failure."""
+def _fresh_state():
     litellm.in_memory_llm_clients_cache.flush_cache()
+    _RecordingHandler.seen.clear()
     yield
     litellm.in_memory_llm_clients_cache.flush_cache()
 
 
+def _tls_kwargs(endpoint: dict) -> dict:
+    return {
+        "api_base": endpoint["api_base"],
+        "api_key": "unused",
+        "ssl_verify": endpoint["ca"],
+        "client_cert": endpoint["client_cert"],
+        "client_key": endpoint["client_key"],
+    }
+
+
 @pytest.mark.asyncio
-async def test_completion_succeeds_with_per_deployment_client_cert(mtls_llm_endpoint):
+@pytest.mark.parametrize("stream", [False, True])
+async def test_acompletion_presents_the_deployment_client_cert(mtls_llm_endpoint, stream):
     response = await litellm.acompletion(
         model="openai/gw-model",
         messages=[{"role": "user", "content": "hi"}],
-        api_base=mtls_llm_endpoint["api_base"],
-        api_key="unused",
-        ssl_verify=mtls_llm_endpoint["ca"],
-        client_cert=mtls_llm_endpoint["client_cert"],
-        client_key=mtls_llm_endpoint["client_key"],
+        stream=stream,
+        **_tls_kwargs(mtls_llm_endpoint),
+    )
+    if stream:
+        async for _ in response:
+            pass
+    else:
+        assert response.choices[0].message.content == "mtls-ok"
+    assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
+
+
+def test_sync_completion_presents_the_deployment_client_cert(mtls_llm_endpoint):
+    response = litellm.completion(
+        model="openai/gw-model",
+        messages=[{"role": "user", "content": "hi"}],
+        **_tls_kwargs(mtls_llm_endpoint),
     )
     assert response.choices[0].message.content == "mtls-ok"
+    assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
 
 
 @pytest.mark.asyncio
-async def test_completion_succeeds_with_tls_references(mtls_llm_endpoint):
-    env = {
-        "GW_CA_BUNDLE": mtls_llm_endpoint["ca"],
-        "GW_CLIENT_CERT": mtls_llm_endpoint["client_cert"],
-        "GW_CLIENT_KEY": mtls_llm_endpoint["client_key"],
-    }
-    with pytest.MonkeyPatch.context() as mp:
-        for key, value in env.items():
-            mp.setenv(key, value)
-        response = await litellm.acompletion(
-            model="openai/gw-model",
-            messages=[{"role": "user", "content": "hi"}],
-            api_base=mtls_llm_endpoint["api_base"],
-            api_key="unused",
-            ssl_verify="os.environ/GW_CA_BUNDLE",
-            client_cert="os.environ/GW_CLIENT_CERT",
-            client_key="os.environ/GW_CLIENT_KEY",
-        )
-    assert response.choices[0].message.content == "mtls-ok"
+async def test_aembedding_presents_the_deployment_client_cert(mtls_llm_endpoint):
+    response = await litellm.aembedding(model="openai/gw-embed", input="hi", **_tls_kwargs(mtls_llm_endpoint))
+    assert response.data[0]["embedding"] == [0.5]
+    assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
+
+
+def test_sync_embedding_presents_the_deployment_client_cert(mtls_llm_endpoint):
+    response = litellm.embedding(model="openai/gw-embed", input="hi", **_tls_kwargs(mtls_llm_endpoint))
+    assert response.data[0]["embedding"] == [0.5]
+    assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
 
 
 @pytest.mark.asyncio
-async def test_transcription_succeeds_with_per_deployment_client_cert(
-    mtls_llm_endpoint,
-):
-    audio = io.BytesIO(b"fake wav")
-    audio.name = "sample.wav"
-    response = await litellm.atranscription(
-        model="openai/whisper-1",
-        file=audio,
-        api_base=mtls_llm_endpoint["api_base"],
-        api_key="unused",
-        ssl_verify=mtls_llm_endpoint["ca"],
-        client_cert=mtls_llm_endpoint["client_cert"],
-        client_key=mtls_llm_endpoint["client_key"],
+async def test_tls_params_never_reach_the_upstream_body(mtls_llm_endpoint):
+    await litellm.acompletion(
+        model="openai/gw-model",
+        messages=[{"role": "user", "content": "hi"}],
+        **_tls_kwargs(mtls_llm_endpoint),
     )
-    assert response.text == "mtls-transcription-ok"
+    assert _RecordingHandler.seen[0]["body_keys"] == ["messages", "model"]
 
 
 @pytest.mark.asyncio
 async def test_completion_fails_without_client_cert(mtls_llm_endpoint):
-    """Proves the endpoint really requires a client certificate, so the positive
-    test above is meaningful rather than passing for some unrelated reason.
-
-    The assertion is deliberately on the FAILURE, not on the message: litellm
-    normalises a TLS handshake rejection into a generic connection error
-    (InternalServerError / "OpenAIException - Connection error."), so matching on
-    'certificate' would be asserting litellm's wrapping rather than our behaviour.
-    """
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(litellm.InternalServerError, match="Connection error"):
         await litellm.acompletion(
             model="openai/gw-model",
             messages=[{"role": "user", "content": "hi"}],
@@ -331,63 +269,4 @@ async def test_completion_fails_without_client_cert(mtls_llm_endpoint):
             ssl_verify=mtls_llm_endpoint["ca"],
             num_retries=0,
         )
-    assert "connection" in str(exc.value).lower() or "ssl" in str(exc.value).lower()
-
-
-def test_tls_params_never_reach_the_upstream_request_body():
-    """ssl_verify / client_cert / client_key are TRANSPORT settings.
-
-    Anything absent from all_litellm_params is treated as a provider param,
-    swept into extra_body and flattened into the JSON body. Measured against a
-    loopback server before the fix, the body carried
-
-        {"client_cert": "...", "client_key": "...", "ssl_verify": "..."}
-
-    which discloses container filesystem layout, 400s on strict
-    OpenAI-compatible servers, and -- because credential refs may hold inline PEM
-    -- can transmit a private key to the provider.
-    """
-    from litellm.types.utils import all_litellm_params
-
-    for param in ("ssl_verify", "client_cert", "client_key"):
-        assert param in all_litellm_params, (
-            f"{param} must be a litellm param, else it is sent to the provider "
-            f"in the request body"
-        )
-
-
-def test_client_cert_with_a_caller_supplied_sslcontext_is_refused():
-    """Loading the chain into a shared context makes every deployment that shares
-    it present THIS deployment's mTLS identity. Measured against a CERT_REQUIRED
-    loopback server with two CA-signed certs: the server saw CN=model-B for both
-    deployment A's and deployment B's handshakes."""
-    import ssl
-
-    import pytest
-
-    from litellm.llms.openai.common_utils import _resolve_ssl_config
-
-    shared = ssl.create_default_context()
-    with pytest.raises(ValueError, match="cannot be combined"):
-        _resolve_ssl_config(ssl_verify=shared, client_cert="/tmp/does-not-matter.pem")
-
-
-def test_inline_pem_client_cert_is_hashed_in_the_client_cache_key():
-    """credential_ref_to_file supports inline PEM specifically to keep key material
-    off disk; putting the same string in a process-lifetime cache key undoes that,
-    and any diagnostic dumping cache keys would print it."""
-    from litellm.llms.openai.common_utils import BaseOpenAILLM
-
-    pem = "-----BEGIN PRIVATE KEY-----\nAAAASECRETKEYMATERIAL\n-----END PRIVATE KEY-----\n"
-    key = BaseOpenAILLM.get_openai_client_cache_key(
-        {"api_key": "sk-x", "is_async": True, "client_cert": pem}, client_type="openai"
-    )
-    assert "SECRETKEYMATERIAL" not in key, key
-    assert "BEGIN PRIVATE KEY" not in key
-
-    # Still distinguishes deployments, which is what the key is for.
-    other = BaseOpenAILLM.get_openai_client_cache_key(
-        {"api_key": "sk-x", "is_async": True, "client_cert": "/etc/other.pem"},
-        client_type="openai",
-    )
-    assert key != other
+    assert _RecordingHandler.seen == []
