@@ -317,3 +317,38 @@ async def test_completion_fails_without_client_cert(mtls_llm_endpoint):
             num_retries=0,
         )
     assert _RecordingHandler.seen == []
+
+
+def _global_client(endpoint: dict, is_async: bool):
+    import httpx
+
+    context = ssl.create_default_context(cafile=endpoint["ca"])
+    context.load_cert_chain(endpoint["server_cert"], endpoint["server_key"])
+    return httpx.AsyncClient(verify=context) if is_async else httpx.Client(verify=context)
+
+
+async def _call(is_async: bool, **kwargs):
+    kwargs = {"model": "openai/gw-model", "messages": [{"role": "user", "content": "hi"}], "max_retries": 0, **kwargs}
+    if is_async:
+        return await litellm.acompletion(**kwargs)
+    return litellm.completion(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [True, False])
+async def test_client_cert_with_a_global_http_client_is_refused(mtls_llm_endpoint, is_async, monkeypatch):
+    attr = "aclient_session" if is_async else "client_session"
+    monkeypatch.setattr(litellm, attr, _global_client(mtls_llm_endpoint, is_async))
+    with pytest.raises(Exception, match=f"litellm.{attr} is set, so this deployment's client_cert"):
+        await _call(is_async, **_tls_kwargs(mtls_llm_endpoint))
+    assert _RecordingHandler.seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [True, False])
+async def test_global_http_client_is_still_used_without_client_cert(mtls_llm_endpoint, is_async, monkeypatch):
+    attr = "aclient_session" if is_async else "client_session"
+    monkeypatch.setattr(litellm, attr, _global_client(mtls_llm_endpoint, is_async))
+    response = await _call(is_async, api_base=mtls_llm_endpoint["api_base"], api_key="unused")
+    assert response.choices[0].message.content == "mtls-ok"
+    assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["localhost"]

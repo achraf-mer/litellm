@@ -39,6 +39,12 @@ from litellm.llms.custom_httpx.http_handler import (
 from litellm.types.llms.custom_http import VerifyTypes
 
 
+_GLOBAL_SESSION_CONFLICT = (
+    "litellm.{attr} is set, so this deployment's client_cert would not be presented. "
+    "Unset litellm.{attr} or remove client_cert from the deployment"
+)
+
+
 class OpenAITLSClientKwargs(TypedDict):
     ssl_verify: Optional[VerifyTypes]
     client_cert: Optional[str]
@@ -240,6 +246,8 @@ class BaseOpenAILLM:
         client_key: Optional[str] = None,
     ) -> Optional[httpx.AsyncClient]:
         if litellm.aclient_session is not None:
+            if client_cert:
+                raise ValueError(_GLOBAL_SESSION_CONFLICT.format(attr="aclient_session"))
             return litellm.aclient_session
 
         if getattr(litellm, "network_mock", False):
@@ -267,6 +275,8 @@ class BaseOpenAILLM:
         client_key: Optional[str] = None,
     ) -> Optional[httpx.Client]:
         if litellm.client_session is not None:
+            if client_cert:
+                raise ValueError(_GLOBAL_SESSION_CONFLICT.format(attr="client_session"))
             return litellm.client_session
 
         if getattr(litellm, "network_mock", False):
