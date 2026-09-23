@@ -3102,6 +3102,7 @@ all_litellm_params = (
         "ssl_verify",
         "client_cert",
         "client_key",
+        "h2o_oauth",
         "metadata",
         "litellm_metadata",
         "litellm_trace_id",
