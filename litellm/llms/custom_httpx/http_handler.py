@@ -1386,6 +1386,18 @@ class HTTPHandler:
             return getattr(litellm, "sync_transport", None)
 
 
+def _handler_params(params: dict) -> dict:
+    handler_params = {
+        k: v for k, v in params.items() if k not in ("disable_aiohttp_transport", "client_cert", "client_key")
+    }
+    client_cert = params.get("client_cert")
+    if client_cert:
+        handler_params["ssl_verify"] = get_client_cert_ssl_context(
+            params.get("ssl_verify"), client_cert, params.get("client_key")
+        )
+    return handler_params
+
+
 def get_async_httpx_client(
     llm_provider: Union[LlmProviders, httpxSpecialProvider],
     params: Optional[dict] = None,
@@ -1422,7 +1434,7 @@ def get_async_httpx_client(
 
     if params is not None:
         # Filter out params that are only used for cache key, not for AsyncHTTPHandler.__init__
-        handler_params = {k: v for k, v in params.items() if k != "disable_aiohttp_transport"}
+        handler_params = _handler_params(params)
         handler_params["shared_session"] = shared_session
         _new_client = AsyncHTTPHandler(**handler_params)
     else:
@@ -1471,7 +1483,7 @@ def _get_httpx_client(params: Optional[dict] = None) -> HTTPHandler:
 
     if params is not None:
         # Filter out params that are only used for cache key, not for HTTPHandler.__init__
-        handler_params = {k: v for k, v in params.items() if k != "disable_aiohttp_transport"}
+        handler_params = _handler_params(params)
         _new_client = HTTPHandler(**handler_params)
     else:
         _new_client = HTTPHandler(timeout=_default_cached_client_timeout())

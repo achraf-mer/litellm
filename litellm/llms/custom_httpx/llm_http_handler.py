@@ -220,6 +220,11 @@ def _custom_logger_callbacks(logging_obj: Any) -> list[Any]:
     return custom_loggers
 
 
+def _tls_client_params(litellm_params: GenericLiteLLMParams) -> Dict[str, object]:
+    optional = {key: litellm_params.get(key) for key in ("client_cert", "client_key") if litellm_params.get(key)}
+    return {"ssl_verify": litellm_params.get("ssl_verify", None), **optional}
+
+
 def _has_pre_call_deployment_hook(logging_obj: Any) -> bool:
     from litellm.integrations.custom_logger import CustomLogger
 
@@ -2336,7 +2341,7 @@ class BaseLLMHTTPHandler:
         )
 
         if client is None or not isinstance(client, HTTPHandler):
-            sync_httpx_client = _get_httpx_client(params={"ssl_verify": litellm_params.get("ssl_verify", None)})
+            sync_httpx_client = _get_httpx_client(params=_tls_client_params(litellm_params))
         else:
             sync_httpx_client = client
 
@@ -2511,7 +2516,7 @@ class BaseLLMHTTPHandler:
             )
             async_httpx_client = get_async_httpx_client(
                 llm_provider=litellm.LlmProviders(custom_llm_provider),
-                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                params=_tls_client_params(litellm_params),
                 shared_session=shared_session,
             )
         else:

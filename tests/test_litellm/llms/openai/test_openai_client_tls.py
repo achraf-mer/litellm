@@ -62,6 +62,13 @@ def test_tls_client_kwargs_reads_litellm_params():
     assert BaseOpenAILLM.tls_client_kwargs(None) == {"ssl_verify": None, "client_cert": None, "client_key": None}
 
 
+def test_ssl_verify_false_with_client_cert_disables_verification(mtls_llm_endpoint):
+    from litellm.llms.custom_httpx.http_handler import get_client_cert_ssl_context
+
+    context = get_client_cert_ssl_context(False, mtls_llm_endpoint["client_cert"], mtls_llm_endpoint["client_key"])
+    assert (context.verify_mode, context.check_hostname) == (ssl.CERT_NONE, False)
+
+
 def test_client_cert_with_a_caller_supplied_sslcontext_is_refused():
     from litellm.llms.custom_httpx.http_handler import get_client_cert_ssl_context
 
@@ -120,7 +127,25 @@ class _RecordingHandler(BaseHTTPRequestHandler):
         peer = self.connection.getpeercert() or {}
         common_name = dict(pair[0] for pair in peer.get("subject", ()))["commonName"]
         _RecordingHandler.seen.append({"path": self.path, "peer_cn": common_name, "body_keys": sorted(body)})
-        if self.path.endswith("/embeddings"):
+        if self.path.endswith("/responses"):
+            response = {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gw-model",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "mtls-ok", "annotations": []}],
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+        elif self.path.endswith("/embeddings"):
             response = {
                 "object": "list",
                 "model": "gw-embed",
@@ -227,13 +252,32 @@ async def test_acompletion_presents_the_deployment_client_cert(mtls_llm_endpoint
     assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
 
 
-def test_sync_completion_presents_the_deployment_client_cert(mtls_llm_endpoint):
+@pytest.mark.parametrize("stream", [False, True])
+def test_sync_completion_presents_the_deployment_client_cert(mtls_llm_endpoint, stream):
     response = litellm.completion(
         model="openai/gw-model",
         messages=[{"role": "user", "content": "hi"}],
+        stream=stream,
         **_tls_kwargs(mtls_llm_endpoint),
     )
-    assert response.choices[0].message.content == "mtls-ok"
+    if stream:
+        for _ in response:
+            pass
+    else:
+        assert response.choices[0].message.content == "mtls-ok"
+    assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
+
+
+@pytest.mark.asyncio
+async def test_aresponses_presents_the_deployment_client_cert(mtls_llm_endpoint):
+    response = await litellm.aresponses(model="openai/gw-model", input="hi", **_tls_kwargs(mtls_llm_endpoint))
+    assert response.output[0].content[0].text == "mtls-ok"
+    assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
+
+
+def test_sync_responses_presents_the_deployment_client_cert(mtls_llm_endpoint):
+    response = litellm.responses(model="openai/gw-model", input="hi", **_tls_kwargs(mtls_llm_endpoint))
+    assert response.output[0].content[0].text == "mtls-ok"
     assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["h2ogpte-client"]
 
 
