@@ -420,6 +420,17 @@ class AnthropicParamsFilterHook(CustomLogger):
                     if isinstance(thinking, dict) and thinking.get('type') == 'enabled':
                         return True
 
+        # A STRING reasoning_effort IS THINKING TOO. LiteLLM's Anthropic transformation maps it to a
+        # `thinking` block AFTER this pre-call hook runs, so the request carries no `thinking` yet
+        # and a caller's temperature=0.0 went out beside enabled thinking: `temperature may only be
+        # set to 1 when thinking is enabled` (h2oai/h2ogpte#11870). h2oGPTe worked around it by
+        # dropping temperature for any Claude model by name; that belongs here. An integer effort is
+        # skipped by the transformation (no thinking), and "none" or blank means thinking off.
+        for d in (data, data.get('extra_body') or {}, litellm_params or {}):
+            effort = d.get('reasoning_effort') if isinstance(d, dict) else None
+            if isinstance(effort, str) and effort.strip().lower() not in ('', 'none'):
+                return True
+
         return False
 
     def _force_temperature_for_thinking(self, data: Dict[str, Any], model: str) -> None:
@@ -511,6 +522,7 @@ class AnthropicParamsFilterHook(CustomLogger):
         "claude-mythos",       # mythos-5 and mythos-preview
         "claude-opus-4-7",
         "claude-opus-4-8",
+        "claude-opus-5",       # opus-5 and opus-5-5; was missing, src.enums has it
         "claude-sonnet-5",
     )
 

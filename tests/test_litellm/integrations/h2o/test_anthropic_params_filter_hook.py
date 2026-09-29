@@ -384,3 +384,31 @@ async def test_deployment_dispatch_survives_a_broken_repair(hook, monkeypatch):
     monkeypatch.setattr(hook, "_remove_top_p_for_anthropic", boom)
     kwargs = {"model": "anthropic/claude-sonnet-4-5-20250929", "top_p": 0.9}
     assert await _deployment(hook, kwargs) is None
+
+
+# --- a string reasoning_effort turns thinking on, so temperature must be 1 -----------------
+# LiteLLM maps reasoning_effort to Anthropic's `thinking` block AFTER this hook, so the request
+# carries no `thinking` yet. h2oGPTe used to drop temperature itself for any Claude by name
+# (h2oai/h2ogpte#11870); the fix belongs here.
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "minimal"])
+async def test_a_string_reasoning_effort_forces_temperature_to_one(hook, effort):
+    data = {"model": "claude-sonnet-4-6", "temperature": 0.0, "reasoning_effort": effort}
+    out = await _run(hook, data)
+    assert out["temperature"] == 1
+
+
+@pytest.mark.parametrize("effort", ["none", "", 16384, None])
+async def test_no_or_an_integer_effort_keeps_the_callers_temperature(hook, effort):
+    data = {"model": "claude-sonnet-4-6", "temperature": 0.0}
+    if effort is not None:
+        data["reasoning_effort"] = effort
+    out = await _run(hook, data)
+    assert out["temperature"] == 0.0
+
+
+async def test_claude_opus_5_5_is_a_no_sampling_model(hook):
+    """It was missing from the hook's copy of the list, so its temperature went out and 400'd."""
+    out = await _run(hook, {"model": "claude-opus-5-5", "temperature": 0.0, "top_p": 0.9})
+    assert "temperature" not in out and "top_p" not in out
