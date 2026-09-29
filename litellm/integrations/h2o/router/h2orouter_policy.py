@@ -348,7 +348,7 @@ def reload_routers() -> int:
     """Forget the loaded routers so the next request re-reads the artefacts directory.
 
     Retraining writes a new artefact; without this the proxy would serve the old router until it was
-    restarted, which is the thing `reload_models_on_demand` exists to avoid for model registration.
+    restarted, which is the thing the proxy's model registry read-through exists to avoid for model registration.
     Returns the number of routers loaded.
     """
     global _LOADED
