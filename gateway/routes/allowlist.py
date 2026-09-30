@@ -47,6 +47,8 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     "/v1/indexes",
     "/v1/models",
     "/models",
+    # h2o: raw router model list (proxy_server.router_model_list), model discovery like /v1/models
+    "/v1/router/models",
     "/openai/",
     "/engines/",
     # Anthropic / agentic data-plane surface
@@ -54,6 +56,7 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     "/messages",
     "/v1/skills",
     "/v1/a2a/",
+    "/a2a/",
     # LiteLLM-native LLM surface
     "/v1/rerank",
     "/v2/rerank",
@@ -82,6 +85,7 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     "/azure_ai/",
     "/aws/",
     "/bedrock/",
+    "/comprehendmedical",
     "/cohere/",
     "/gemini/",
     "/google/",
@@ -92,6 +96,7 @@ GATEWAY_PATH_PREFIXES: tuple[str, ...] = (
     "/langfuse/",
     "/vllm/",
     "/mistral/",
+    "/typesafe/",
     "/groq/",
     "/voyage/",
     "/cursor/",

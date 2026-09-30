@@ -1,14 +1,10 @@
 import asyncio
 import json
 import os
-import sys
 
 import pytest
 from fastapi.testclient import TestClient
 
-sys.path.insert(
-    0, os.path.abspath("../../../../..")
-)  # Adds the parent directory to the system path
 from unittest.mock import MagicMock, patch
 
 import litellm
@@ -30,7 +26,7 @@ def test_transform_usage():
         }
     )
     config = AmazonConverseConfig()
-    openai_usage = config._transform_usage(usage)
+    openai_usage = config.transform_usage(usage)
     assert (
         openai_usage.prompt_tokens
         == usage["inputTokens"]
@@ -62,7 +58,7 @@ def test_transform_usage_with_reasoning_content():
     )
     config = AmazonConverseConfig()
     reasoning_text = "Let me think about this step by step."
-    openai_usage = config._transform_usage(usage, reasoning_content=reasoning_text)
+    openai_usage = config.transform_usage(usage, reasoning_content=reasoning_text)
     assert openai_usage.completion_tokens_details is not None
     assert openai_usage.completion_tokens_details.reasoning_tokens > 0
     assert openai_usage.completion_tokens_details.text_tokens == (
@@ -370,6 +366,73 @@ def test_output_config_effort_forwarded_into_additional_request_fields(model):
     assert additional.get("output_config") == {"effort": "high"}
 
 
+@pytest.mark.parametrize(
+    "model,effort,expected_effort",
+    [
+        ("bedrock/converse/us.anthropic.claude-opus-4-7", "max", "max"),
+        ("bedrock/converse/us.anthropic.claude-opus-4-6-v1", "xhigh", "max"),
+    ],
+)
+def test_explicit_output_config_effort_mapped_for_adaptive_thinking_converse(model, effort, expected_effort):
+    """Regression: Claude Code drives adaptive thinking as ``thinking: {"type":
+    "adaptive"}`` plus ``output_config: {"effort": ...}``. ``output_config`` must
+    be a supported openai param and survive ``map_openai_params`` (clamped to the
+    model's Bedrock effort ceiling), otherwise the Converse request carries
+    adaptive thinking without an effort tier and Bedrock streams zero
+    ``reasoningContent`` blocks."""
+    config = AmazonConverseConfig()
+
+    assert "output_config" in config.get_supported_openai_params(model)
+
+    optional_params = config.map_openai_params(
+        non_default_params={
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": effort},
+        },
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    assert optional_params["thinking"] == {"type": "adaptive"}
+    assert optional_params["output_config"] == {"effort": expected_effort}
+
+
+def test_output_config_supported_param_for_arn_models_converse():
+    """ARN model ids hide the underlying Claude model, so ``output_config`` must
+    be in the blanket ARN supported-params list too."""
+    config = AmazonConverseConfig()
+    arn_model = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcdef123456"
+    assert "output_config" in config.get_supported_openai_params(arn_model)
+
+
+def test_output_config_effort_forwarded_for_application_inference_profile_arn():
+    """Regression: opaque application inference profile ARNs cannot resolve a
+    base model, so the anthropic-only serialization gate dropped ``output_config``
+    while still sending ``thinking``: adaptive thinking with no effort tier, and
+    Bedrock streams zero ``reasoningContent`` blocks. The effort must be forwarded
+    verbatim (ceilings and capability gates are unknowable behind the alias) for
+    Bedrock to enforce."""
+    config = AmazonConverseConfig()
+    arn_model = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcdef123456"
+
+    result = config._transform_request(
+        model=arn_model,
+        messages=[{"role": "user", "content": "hi"}],
+        optional_params={
+            "maxTokens": 256,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+        },
+        litellm_params={},
+        headers={},
+    )
+
+    additional = result.get("additionalModelRequestFields", {})
+    assert additional.get("thinking") == {"type": "adaptive"}
+    assert additional.get("output_config") == {"effort": "max"}
+
+
 def test_output_config_format_translated_to_native_output_config_converse():
     """``output_config.format`` becomes Bedrock ``outputConfig`` and is not forwarded raw."""
     config = AmazonConverseConfig()
@@ -611,16 +674,19 @@ def test_transform_request_helper_includes_anthropic_beta_and_tools():
     assert fields["tools"][0]["type"] == "computer_20250124"
 
 
-def test_parallel_tool_calls_config_kept_for_sonnet_5():
+def test_parallel_tool_calls_config_kept_for_sonnet_5(monkeypatch):
     old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
     old_cost = litellm.model_cost
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
     try:
         config = AmazonConverseConfig()
         optional_params = config.map_openai_params(
             model="anthropic.claude-sonnet-5",
-            non_default_params={"parallel_tool_calls": False},
+            # ``tools`` is required for this path: Anthropic rejects a
+            # ``tool_choice`` sent without tools, so the config is only built for
+            # a request that actually has them.
+            non_default_params={"parallel_tool_calls": False, "tools": _TOOL_PARAM},
             optional_params={},
             drop_params=False,
         )
@@ -632,15 +698,92 @@ def test_parallel_tool_calls_config_kept_for_sonnet_5():
             messages=None,
         )
 
+        # ``tool_choice`` must carry ``type`` — the Anthropic-on-Bedrock
+        # validator returns 400 "missing field `type`" otherwise, per the
+        # customer traceback in the originating report. Mirrors the native
+        # Anthropic transform, which defaults to ``type="auto"``.
         assert data["additionalModelRequestFields"]["tool_choice"] == {
-            "disable_parallel_tool_use": True
+            "type": "auto",
+            "disable_parallel_tool_use": True,
         }
     finally:
         litellm.model_cost = old_cost
         if old_env is None:
             os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         else:
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", old_env)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        # Two models, not six. Every model carrying
+        # ``supports_parallel_tool_use_config`` in the cost map is Anthropic, and
+        # the code path does not branch on the model beyond that flag — so the
+        # extra four parametrizations asserted the cost map's contents rather
+        # than this code, and passed or failed together under every mutation.
+        # One bare id and one ``us.`` cross-region id keeps the prefix-handling
+        # coverage that does matter.
+        "anthropic.claude-sonnet-5",
+        "us.anthropic.claude-sonnet-5",
+    ],
+)
+def test_parallel_tool_calls_tool_choice_includes_type(model: str):
+    """tool_choice must carry ``type`` for every current Bedrock Converse model
+    that supports the parallel-tool-use config, else Bedrock 400s."""
+    old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
+    old_cost = litellm.model_cost
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+    try:
+        config = AmazonConverseConfig()
+        optional_params = config.map_openai_params(
+            model=model,
+            non_default_params={"parallel_tool_calls": False, "tools": _TOOL_PARAM},
+            optional_params={},
+            drop_params=False,
+        )
+        data = config._transform_request_helper(
+            model=model,
+            system_content_blocks=[],
+            optional_params=optional_params,
+            messages=None,
+        )
+        tool_choice = data["additionalModelRequestFields"]["tool_choice"]
+        assert tool_choice["type"] == "auto", f"tool_choice.type missing for {model}: {tool_choice}"
+        assert tool_choice["disable_parallel_tool_use"] is True
+    finally:
+        litellm.model_cost = old_cost
+        if old_env is None:
+            os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+        else:
             os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+
+
+@pytest.mark.parametrize(
+    "tool_choice, expected_native",
+    [
+        # An explicit tool_choice must survive parallel_tool_calls=False rather than
+        # being silently overridden with "auto". It rides on the native
+        # toolConfig.toolChoice; the passthrough carries only the disable flag.
+        ("required", {"any": {}}),
+        # A bare dict with no "type" key: the native mapper treats ANY dict as a
+        # named-tool choice, so the forced-tool directive must not be lost.
+        ({"function": {"name": "get_current_weather"}}, {"tool": {"name": "get_current_weather"}}),
+        (
+            {"type": "function", "function": {"name": "get_current_weather"}},
+            {"tool": {"name": "get_current_weather"}},
+        ),
+    ],
+)
+def test_parallel_tool_calls_preserves_explicit_tool_choice_type(tool_choice, expected_native):
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {"tool_choice": tool_choice, "parallel_tool_calls": False, "tools": _TOOL_PARAM},
+    )
+    assert data["toolConfig"]["toolChoice"] == expected_native
+    # No ``type`` beside toolConfig.toolChoice: Converse 400s on the pair.
+    assert data["additionalModelRequestFields"]["tool_choice"] == {"disable_parallel_tool_use": True}
 
 
 def test_parallel_tool_calls_config_dropped_for_ttl_only_model(
@@ -1092,53 +1235,57 @@ def test_transform_response_with_structured_response_calling_tool():
     )
 
 
+def _mock_converse_response() -> MagicMock:
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.json.return_value = {
+        "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+    }
+    mock_response.text = json.dumps(mock_response.json.return_value)
+    return mock_response
+
+
+async def _acompletion_captured_request_body(tools: list, messages: list) -> dict:
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    client = AsyncHTTPHandler()
+    with patch.object(client, "post", return_value=_mock_converse_response()) as mock_post:
+        response = await litellm.acompletion(
+            model="bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            messages=messages,
+            tools=tools,
+            aws_access_key_id="fake-access-key",
+            aws_secret_access_key="fake-secret-key",
+            aws_region_name="us-west-2",
+            client=client,
+        )
+
+    assert response.choices[0].message.content == "ok"
+    mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs["url"].endswith("/converse")
+    return json.loads(mock_post.call_args.kwargs["data"])
+
+
 @pytest.mark.asyncio
 async def test_bedrock_bash_tool_acompletion():
-    """Test Bedrock with bash tool for ls command using acompletion."""
-
-    # Test with bash tool instead of computer tool
+    """Bash tool rides acompletion into the converse request body without any network call."""
     tools = [
         {
             "type": "bash_20241022",
             "name": "bash",
         }
     ]
-
     messages = [{"role": "user", "content": "run ls command and find all python files"}]
 
-    try:
-        response = await litellm.acompletion(
-            model="bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            messages=messages,
-            tools=tools,
-            # Using dummy API key - test should fail with auth error, proving request formatting works
-            api_key="dummy-key-for-testing",
-        )
-        # If we get here, something's wrong - we expect an auth error
-        assert False, "Expected authentication error but got successful response"
-    except Exception as e:
-        error_str = str(e).lower()
+    request_body = await _acompletion_captured_request_body(tools=tools, messages=messages)
 
-        # Check if it's an expected authentication/credentials error
-        auth_error_indicators = [
-            "credentials",
-            "authentication",
-            "unauthorized",
-            "access denied",
-            "aws",
-            "region",
-            "profile",
-            "token",
-            "invalid",
-            "signature",
-        ]
-
-        if any(auth_error in error_str for auth_error in auth_error_indicators):
-            # This is expected - request formatting succeeded, auth failed as expected
-            assert True
-        else:
-            # Unexpected error - might be tool handling issue
-            pytest.fail(f"Unexpected error (might be tool handling issue): {e}")
+    additional_fields = request_body["additionalModelRequestFields"]
+    assert additional_fields["tools"] == [{"type": "bash_20241022", "name": "bash"}]
+    assert "anthropic_beta" in additional_fields
+    assert request_body["messages"][0]["content"][0]["text"] == "run ls command and find all python files"
 
 
 @pytest.mark.asyncio
@@ -1171,39 +1318,16 @@ async def test_bedrock_computer_use_acompletion():
         }
     ]
 
-    try:
-        response = await litellm.acompletion(
-            model="bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            messages=messages,
-            tools=tools,
-            # Using dummy API key - test should fail with auth error, proving request formatting works
-            api_key="dummy-key-for-testing",
-        )
-        # If we get here, something's wrong - we expect an auth error
-        assert False, "Expected authentication error but got successful response"
-    except Exception as e:
-        error_str = str(e).lower()
+    request_body = await _acompletion_captured_request_body(tools=tools, messages=messages)
 
-        # Check if it's an expected authentication/credentials error
-        auth_error_indicators = [
-            "credentials",
-            "authentication",
-            "unauthorized",
-            "access denied",
-            "aws",
-            "region",
-            "profile",
-            "token",
-            "invalid",
-            "signature",
-        ]
-
-        if any(auth_error in error_str for auth_error in auth_error_indicators):
-            # This is expected - request formatting succeeded, auth failed as expected
-            assert True
-        else:
-            # Unexpected error - might be tool handling issue
-            pytest.fail(f"Unexpected error (might be tool handling issue): {e}")
+    additional_fields = request_body["additionalModelRequestFields"]
+    assert additional_fields["anthropic_beta"] == ["computer-use-2025-01-24"]
+    computer_tools = [tool for tool in additional_fields["tools"] if tool.get("type") == "computer_20250124"]
+    assert computer_tools[0]["display_height_px"] == 768
+    assert computer_tools[0]["display_width_px"] == 1024
+    image_blocks = [block for block in request_body["messages"][0]["content"] if "image" in block]
+    assert image_blocks[0]["image"]["format"] == "png"
+    assert image_blocks[0]["image"]["source"]["bytes"]
 
 
 @pytest.mark.asyncio
@@ -2954,7 +3078,7 @@ def test_request_metadata_validation():
     # Test too many items (max 16)
     too_many_items = {f"key_{i}": f"value_{i}" for i in range(17)}
 
-    try:
+    with pytest.raises(Exception, match="maximum of 16 items") as exc_info:
         config.transform_request(
             model="anthropic.claude-haiku-4-5-20251001-v1:0",
             messages=messages,
@@ -2962,9 +3086,8 @@ def test_request_metadata_validation():
             litellm_params={},
             headers={},
         )
-        assert False, "Should have raised validation error for too many items"
-    except Exception as e:
-        assert "maximum of 16 items" in str(e).lower()
+    e = exc_info.value
+    assert "maximum of 16 items" in str(e).lower()
 
 
 def test_request_metadata_key_constraints():
@@ -2977,7 +3100,7 @@ def test_request_metadata_key_constraints():
     long_key = "a" * 257
     invalid_metadata = {long_key: "value"}
 
-    try:
+    with pytest.raises(Exception, match=r"(?i)key length|256 characters"):
         config.transform_request(
             model="anthropic.claude-haiku-4-5-20251001-v1:0",
             messages=messages,
@@ -2985,14 +3108,11 @@ def test_request_metadata_key_constraints():
             litellm_params={},
             headers={},
         )
-        assert False, "Should have raised validation error for key too long"
-    except Exception as e:
-        assert "key length" in str(e).lower() or "256 characters" in str(e).lower()
 
     # Test empty key
     invalid_metadata = {"": "value"}
 
-    try:
+    with pytest.raises(Exception, match=r"(?i)key length|empty"):
         config.transform_request(
             model="anthropic.claude-haiku-4-5-20251001-v1:0",
             messages=messages,
@@ -3000,9 +3120,6 @@ def test_request_metadata_key_constraints():
             litellm_params={},
             headers={},
         )
-        assert False, "Should have raised validation error for empty key"
-    except Exception as e:
-        assert "key length" in str(e).lower() or "empty" in str(e).lower()
 
 
 def test_request_metadata_value_constraints():
@@ -3015,7 +3132,7 @@ def test_request_metadata_value_constraints():
     long_value = "a" * 257
     invalid_metadata = {"key": long_value}
 
-    try:
+    with pytest.raises(Exception, match=r"(?i)value length|256 characters"):
         config.transform_request(
             model="anthropic.claude-haiku-4-5-20251001-v1:0",
             messages=messages,
@@ -3023,9 +3140,6 @@ def test_request_metadata_value_constraints():
             litellm_params={},
             headers={},
         )
-        assert False, "Should have raised validation error for value too long"
-    except Exception as e:
-        assert "value length" in str(e).lower() or "256 characters" in str(e).lower()
 
     # Test empty value (should be allowed)
     valid_metadata = {"key": ""}
@@ -3536,7 +3650,7 @@ def test_drop_thinking_param_when_thinking_blocks_missing():
         litellm.modify_params = original_modify_params
 
 
-def test_supports_native_structured_outputs():
+def test_supports_native_structured_outputs(monkeypatch):
     """Test model detection for native structured outputs support.
 
     Support is driven by the ``supports_native_structured_output`` flag in the
@@ -3544,7 +3658,7 @@ def test_supports_native_structured_outputs():
     """
     old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
     old_cost = litellm.model_cost
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
     try:
         config = AmazonConverseConfig()
@@ -3580,6 +3694,8 @@ def test_supports_native_structured_outputs():
         assert config._supports_native_structured_outputs("nvidia.nemotron-nano-3-30b")
         # DeepSeek: old substring "deepseek-v3.1" didn't match real ID
         assert config._supports_native_structured_outputs("deepseek.v3-v1:0")
+        assert config._supports_native_structured_outputs("deepseek.v3.2")
+        assert config._supports_native_structured_outputs("zai.glm-5")
 
         # Unsupported models -- should fall back to tool-call approach
         assert not config._supports_native_structured_outputs(
@@ -3604,7 +3720,7 @@ def test_supports_native_structured_outputs():
         if old_env is None:
             os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         else:
-            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", old_env)
 
 
 def test_create_output_config_for_response_format():
@@ -3642,11 +3758,11 @@ def test_create_output_config_for_response_format():
     assert parsed_schema == expected
 
 
-def test_translate_response_format_native_output_config():
+def test_translate_response_format_native_output_config(monkeypatch):
     """For supported models, _translate_response_format_param should produce outputConfig."""
     old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
     old_cost = litellm.model_cost
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
     try:
         config = AmazonConverseConfig()
@@ -3702,7 +3818,7 @@ def test_translate_response_format_native_output_config():
         if old_env is None:
             os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         else:
-            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", old_env)
 
 
 def test_translate_response_format_fallback_tool_call():
@@ -3737,11 +3853,11 @@ def test_translate_response_format_fallback_tool_call():
     assert result["json_mode"] is True
 
 
-def test_native_structured_output_no_fake_stream():
+def test_native_structured_output_no_fake_stream(monkeypatch):
     """When using native structured outputs with streaming, fake_stream should NOT be set."""
     old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
     old_cost = litellm.model_cost
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
     try:
         config = AmazonConverseConfig()
@@ -3787,7 +3903,7 @@ def test_native_structured_output_no_fake_stream():
         if old_env is None:
             os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         else:
-            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", old_env)
 
 
 def test_transform_request_with_output_config():
@@ -4075,7 +4191,7 @@ def test_add_additional_properties_definitions():
     )
 
 
-def test_json_object_no_schema_skips_tool_injection():
+def test_json_object_no_schema_skips_tool_injection(monkeypatch):
     """response_format: {type: json_object} with no schema should NOT inject
     the synthetic json_tool_call tool.
 
@@ -4085,7 +4201,7 @@ def test_json_object_no_schema_skips_tool_injection():
     the model respond naturally with the JSON the caller asked for."""
     old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
     old_cost = litellm.model_cost
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
     try:
         config = AmazonConverseConfig()
@@ -4111,7 +4227,7 @@ def test_json_object_no_schema_skips_tool_injection():
         if old_env is None:
             os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         else:
-            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", old_env)
 
 
 def test_output_config_applies_additional_properties():
@@ -4249,6 +4365,121 @@ def test_parallel_tool_calls_older_model_drops_disable_flag():
     additional = request_data.get("additionalModelRequestFields", {})
     assert "tool_choice" not in additional
     assert "parallel_tool_calls" not in additional
+
+
+@pytest.mark.parametrize(
+    "parallel_tool_calls, expected_disable",
+    [(True, False), (False, True)],
+)
+def test_parallel_tool_calls_emits_typed_auto_tool_choice(parallel_tool_calls, expected_disable):
+    config = AmazonConverseConfig()
+    model = "us.anthropic.claude-opus-4-8"
+    messages = [{"role": "user", "content": "What's the weather in SF and NYC?"}]
+
+    optional_params = config.map_openai_params(
+        non_default_params={"parallel_tool_calls": parallel_tool_calls, "tools": _TOOL_PARAM},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    request_data = config.transform_request(
+        model=model,
+        messages=messages,
+        optional_params=optional_params,
+        litellm_params={},
+        headers={},
+    )
+
+    assert request_data["additionalModelRequestFields"]["tool_choice"] == {
+        "type": "auto",
+        "disable_parallel_tool_use": expected_disable,
+    }
+
+
+@pytest.mark.parametrize(
+    "tool_choice, expected_tool_config_choice",
+    [
+        ("auto", {"auto": {}}),
+        ("required", {"any": {}}),
+        ({"type": "function", "function": {"name": "get_current_weather"}}, {"tool": {"name": "get_current_weather"}}),
+    ],
+)
+def test_parallel_tool_calls_with_explicit_tool_choice_omits_conflicting_type(tool_choice, expected_tool_config_choice):
+    config = AmazonConverseConfig()
+    model = "us.anthropic.claude-opus-4-8"
+    messages = [{"role": "user", "content": "What's the weather in SF and NYC?"}]
+
+    optional_params = config.map_openai_params(
+        non_default_params={"parallel_tool_calls": False, "tool_choice": tool_choice, "tools": _TOOL_PARAM},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    request_data = config.transform_request(
+        model=model,
+        messages=messages,
+        optional_params=optional_params,
+        litellm_params={},
+        headers={},
+    )
+
+    assert request_data["toolConfig"]["toolChoice"] == expected_tool_config_choice
+    assert request_data["additionalModelRequestFields"]["tool_choice"] == {"disable_parallel_tool_use": True}
+
+
+def test_tool_choice_type_kept_when_no_tool_config_choice_conflicts():
+    config = AmazonConverseConfig()
+    model = "us.anthropic.claude-opus-4-8"
+
+    optional_params = config.map_openai_params(
+        non_default_params={"parallel_tool_calls": False, "tools": _TOOL_PARAM},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    request_data = config.transform_request(
+        model=model,
+        messages=[{"role": "user", "content": "What's the weather in SF and NYC?"}],
+        optional_params=optional_params,
+        litellm_params={},
+        headers={},
+    )
+
+    assert "toolChoice" not in request_data["toolConfig"]
+    assert request_data["additionalModelRequestFields"]["tool_choice"] == {
+        "type": "auto",
+        "disable_parallel_tool_use": True,
+    }
+
+
+def test_drop_tool_choice_type_leaves_other_passthrough_fields_untouched():
+    additional_request_params = {
+        "tool_choice": {"type": "tool", "name": "get_weather", "disable_parallel_tool_use": True},
+        "anthropic_beta": ["some-beta"],
+    }
+
+    AmazonConverseConfig._drop_tool_choice_type_conflicting_with_tool_config(additional_request_params)
+
+    assert additional_request_params == {
+        "tool_choice": {"name": "get_weather", "disable_parallel_tool_use": True},
+        "anthropic_beta": ["some-beta"],
+    }
+
+
+def test_parallel_tool_use_merge_preserves_user_tool_choice_type():
+    merged = AmazonConverseConfig._merge_parallel_tool_use_config(
+        {"tool_choice": {"type": "tool", "name": "get_weather", "disable_parallel_tool_use": False}},
+        {"tool_choice": {"type": "auto", "disable_parallel_tool_use": True}},
+    )
+
+    assert merged["tool_choice"] == {
+        "type": "tool",
+        "name": "get_weather",
+        "disable_parallel_tool_use": True,
+    }
 
 
 class TestBedrockMinThinkingBudgetTokens:
@@ -4649,7 +4880,7 @@ def test_cache_control_injection_tool_config_not_added_without_injection_point()
     assert all("cachePoint" not in tool for tool in tools)
 
 
-def test_cache_control_injection_tool_config_honors_ttl_for_supported_model():
+def test_cache_control_injection_tool_config_honors_ttl_for_supported_model(monkeypatch):
     """
     Regression test: cache_control_injection_points with location=tool_config
     must honor the requested `control.ttl`, mirroring the message/system
@@ -4663,7 +4894,7 @@ def test_cache_control_injection_tool_config_honors_ttl_for_supported_model():
     """
     old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
     old_cost = litellm.model_cost
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
     try:
         config = AmazonConverseConfig()
@@ -4702,10 +4933,10 @@ def test_cache_control_injection_tool_config_honors_ttl_for_supported_model():
         if old_env is None:
             os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         else:
-            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", old_env)
 
 
-def test_cache_control_injection_tool_config_honors_ttl_for_regional_model_lacking_own_pricing():
+def test_cache_control_injection_tool_config_honors_ttl_for_regional_model_lacking_own_pricing(monkeypatch):
     """
     Regression test: a regional pricing entry that omits
     `cache_creation_input_token_cost_above_1hr` (e.g. `jp.anthropic.claude-opus-4-7`)
@@ -4714,7 +4945,7 @@ def test_cache_control_injection_tool_config_honors_ttl_for_regional_model_lacki
     """
     old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
     old_cost = litellm.model_cost
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
     try:
         assert "cache_creation_input_token_cost_above_1hr" not in litellm.model_cost["jp.anthropic.claude-opus-4-7"]
@@ -4755,7 +4986,7 @@ def test_cache_control_injection_tool_config_honors_ttl_for_regional_model_lacki
         if old_env is None:
             os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         else:
-            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+            monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", old_env)
 
 
 def test_cache_control_injection_tool_config_drops_ttl_for_unsupported_model():
@@ -5767,3 +5998,464 @@ def test_message_level_cache_control_drops_ttl_for_unsupported_model(ttl_target)
     cache_points = _collect_cache_points(result)
     assert len(cache_points) == 1
     assert "ttl" not in cache_points[0]
+
+
+# ---------------------------------------------------------------------------
+# parallel_tool_calls on Anthropic-on-Bedrock, pinned at REQUEST level.
+#
+# The caller's tool_choice rides on the native toolConfig.toolChoice and the
+# Anthropic passthrough carries only disable_parallel_tool_use (upstream's
+# design). These tests (h2o) pin the cases where the two could disagree, and the
+# guards in _drop_parallel_tool_use_config_with_nothing_to_say -- assertions on
+# optional_params alone missed several of them.
+# ---------------------------------------------------------------------------
+
+
+def _converse_request(model: str, non_default_params: dict, drop_params: bool = False) -> dict:
+    old_env = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
+    old_cost = litellm.model_cost
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+    try:
+        config = AmazonConverseConfig()
+        optional_params = config.map_openai_params(
+            model=model,
+            non_default_params=non_default_params,
+            optional_params={},
+            drop_params=drop_params,
+        )
+        return config._transform_request_helper(
+            model=model,
+            system_content_blocks=[],
+            optional_params=optional_params,
+            messages=None,
+        )
+    finally:
+        litellm.model_cost = old_cost
+        if old_env is None:
+            os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+        else:
+            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = old_env
+
+
+def test_thinking_forced_tool_downgrade_reaches_the_request():
+    """The reasoning downgrade must not be bypassed by the parallel config.
+
+    map_openai_params downgrades forced tool use to ``auto`` when thinking is
+    enabled, because Anthropic-on-Bedrock rejects the combination. The parallel
+    passthrough must not re-send a forced type behind the downgrade's back.
+    Asserted at request level: assertions on optional_params cannot see it.
+    """
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {
+            "tools": _TOOL_PARAM,
+            "tool_choice": "required",
+            "parallel_tool_calls": False,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+        },
+    )
+    assert data["toolConfig"]["toolChoice"] == {"auto": {}}
+    passthrough = data["additionalModelRequestFields"]["tool_choice"]
+    assert passthrough.get("type") in (None, "auto"), (
+        f"forced tool use must be downgraded with thinking enabled, got {passthrough}"
+    )
+    assert passthrough["disable_parallel_tool_use"] is True
+
+
+def test_unsanitized_tool_name_is_not_forwarded_raw():
+    """Bedrock tool names must match [a-zA-Z][a-zA-Z0-9_-]*.
+
+    The tool list and the native toolChoice are both sanitized. Forwarding the
+    raw name meant forcing a tool that did not exist in toolConfig.tools -- a
+    guaranteed ValidationException for any namespaced/MCP-style tool name.
+    """
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get.current weather",
+                "description": "d",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {
+            "tools": tools,
+            "tool_choice": {"type": "function", "function": {"name": "get.current weather"}},
+            "parallel_tool_calls": False,
+        },
+    )
+    forced = data["toolConfig"]["toolChoice"]["tool"]["name"]
+    listed = [t["toolSpec"]["name"] for t in data["toolConfig"]["tools"]]
+    assert forced in listed, f"forced tool {forced!r} is not in the tool list {listed}"
+    assert " " not in forced and "." not in forced
+    # The raw name must not ride on the passthrough either.
+    assert "name" not in data["additionalModelRequestFields"]["tool_choice"]
+
+
+def test_parallel_tool_calls_true_leaves_the_native_tool_choice_alone():
+    """``parallel_tool_calls: true`` must not move or weaken the forced-tool directive.
+
+    The native toolChoice keeps it; the passthrough carries only the flag, with no
+    ``type`` that would conflict with toolConfig.toolChoice.
+    """
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {"tools": _TOOL_PARAM, "tool_choice": "required", "parallel_tool_calls": True},
+    )
+    assert data["toolConfig"]["toolChoice"] == {"any": {}}
+    assert data["additionalModelRequestFields"]["tool_choice"] == {"disable_parallel_tool_use": False}
+
+
+def test_no_config_emitted_without_tools():
+    """Anthropic rejects tool_choice sent without tools, so do not invent one."""
+    data = _converse_request("anthropic.claude-sonnet-5", {"parallel_tool_calls": False})
+    assert "tool_choice" not in data.get("additionalModelRequestFields", {})
+
+
+def test_parallel_tool_calls_none_does_not_disable_parallel_use():
+    """``parallel_tool_calls: null`` is not a request to disable anything.
+
+    ``not None`` is True, so the old ``disable_parallel = not value`` turned an
+    explicit null into disable_parallel_tool_use=True.
+    """
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {"tools": _TOOL_PARAM, "parallel_tool_calls": None},
+    )
+    assert "tool_choice" not in data.get("additionalModelRequestFields", {})
+
+
+def test_tool_choice_without_parallel_tool_calls_is_untouched():
+    """The PR's own non-regression claim, asserted at request level.
+
+    Nothing had pinned it: a caller who never sends parallel_tool_calls must get
+    the native toolChoice exactly as before.
+    """
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {"tools": _TOOL_PARAM, "tool_choice": "required"},
+    )
+    assert data["toolConfig"]["toolChoice"] == {"any": {}}
+    assert "tool_choice" not in data.get("additionalModelRequestFields", {})
+
+
+def test_config_is_not_emitted_for_models_without_support():
+    """Gated by the cost-map flag: a non-Anthropic Bedrock model keeps the native
+    field and gets no passthrough."""
+    data = _converse_request(
+        "mistral.mistral-large-2402-v1:0",
+        {"tools": _TOOL_PARAM, "tool_choice": "required", "parallel_tool_calls": False},
+    )
+    assert data["toolConfig"]["toolChoice"] == {"any": {}}
+    assert "tool_choice" not in data.get("additionalModelRequestFields", {})
+
+
+def test_non_list_tools_do_not_produce_a_tool_choice_without_toolconfig():
+    """The guard must read the MAPPED tools, not the caller's raw value.
+
+    A truthy non-list ``tools`` passes a non_default_params check but is skipped
+    by the mapping loop's isinstance(value, list) guard, so the request came out
+    with additionalModelRequestFields.tool_choice and no toolConfig.tools -- the
+    exact 400 the guard exists to prevent.
+    """
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {
+            "tools": {"type": "function", "function": {"name": "get_weather"}},
+            "tool_choice": "required",
+            "parallel_tool_calls": False,
+        },
+    )
+    passthrough = data.get("additionalModelRequestFields", {}).get("tool_choice")
+    listed = (data.get("toolConfig") or {}).get("tools") or []
+    assert not passthrough or listed, (
+        f"emitted tool_choice {passthrough} with no tools in toolConfig"
+    )
+
+
+def test_response_format_injected_tools_still_honour_parallel_tool_calls():
+    """The other direction of the same guard.
+
+    A json_schema response_format injects a synthetic tool into optional_params
+    with nothing in non_default_params, so reading the raw value silently ignored
+    parallel_tool_calls for it.
+    """
+    # The bare id, NOT "anthropic.<id>": of the 59 models carrying
+    # supports_parallel_tool_use_config this is the only one WITHOUT
+    # supports_native_structured_output, so it is the only one that takes the
+    # synthetic-tool branch instead of outputConfig. Picking any other model makes
+    # this test vacuous -- no tool is injected, `toolConfig.tools` is empty, and a
+    # conditional assertion never runs. (An earlier version of this test did
+    # exactly that and passed with the fix reverted.)
+    data = _converse_request(
+        "claude-sonnet-4-5-20250929-v1:0",
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "out",
+                    "schema": {"type": "object", "properties": {"a": {"type": "string"}}},
+                },
+            },
+            "parallel_tool_calls": False,
+        },
+    )
+    listed = [t["toolSpec"]["name"] for t in (data.get("toolConfig") or {}).get("tools") or []]
+    assert listed == ["json_tool_call"], f"expected the synthetic tool, got {listed}"
+    assert data["toolConfig"]["toolChoice"] == {"tool": {"name": "json_tool_call"}}
+    passthrough = data["additionalModelRequestFields"]["tool_choice"]
+    assert passthrough == {"disable_parallel_tool_use": True}, passthrough
+
+
+def test_tool_choice_none_is_not_reinvented_as_auto():
+    """A caller who said "no tools" must not have ``auto`` asserted for them.
+
+    map_tool_choice_values drops "none" and returns None, which is
+    indistinguishable from "sent nothing" once inside the config builder. litellm's
+    own Anthropic transform refuses this too.
+    """
+    # drop_params=True: Bedrock raises UnsupportedParamsError for
+    # tool_choice="none" otherwise, so the dropped path -- the one where
+    # map_tool_choice_values returns None and the caller's intent is invisible
+    # downstream -- only exists here.
+    data = _converse_request(
+        "anthropic.claude-sonnet-5",
+        {"tools": _TOOL_PARAM, "tool_choice": "none", "parallel_tool_calls": False},
+        drop_params=True,
+    )
+    assert "tool_choice" not in data.get("additionalModelRequestFields", {})
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "bedrock/converse/us.anthropic.claude-haiku-4-5",
+        "bedrock/converse/us.anthropic.claude-sonnet-4-5",
+    ],
+)
+def test_adaptive_thinking_translated_to_legacy_on_pre_46_converse(model):
+    """Raw thinking={type: adaptive} from callers like Claude Code must be
+    translated to legacy thinking={type: enabled, budget_tokens} for pre-4.6
+    models on Bedrock Converse rather than forwarded as-is and rejected."""
+    config = AmazonConverseConfig()
+
+    optional_params = config.map_openai_params(
+        non_default_params={"thinking": {"type": "adaptive"}, "max_tokens": 8192},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    thinking = optional_params.get("thinking")
+    assert thinking is not None
+    assert thinking["type"] == "enabled"
+    assert isinstance(thinking.get("budget_tokens"), int)
+    assert thinking["budget_tokens"] < 8192
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "bedrock/converse/us.anthropic.claude-opus-4-7",
+        "bedrock/converse/us.anthropic.claude-sonnet-4-6",
+    ],
+)
+def test_adaptive_thinking_passes_through_on_46_plus_converse(model):
+    """thinking={type: adaptive} must be forwarded unchanged for 4.6+ models
+    that natively support adaptive thinking."""
+    config = AmazonConverseConfig()
+
+    optional_params = config.map_openai_params(
+        non_default_params={"thinking": {"type": "adaptive"}, "max_tokens": 8192},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+
+    assert optional_params.get("thinking") == {"type": "adaptive"}
+
+
+def test_adaptive_thinking_dropped_when_max_tokens_too_small_converse():
+    """When max_tokens can't fit even the minimum thinking budget, the raw
+    adaptive block must be dropped entirely rather than translated, so the
+    Bedrock Converse request still succeeds."""
+    from litellm.constants import ANTHROPIC_MIN_THINKING_BUDGET_TOKENS
+
+    config = AmazonConverseConfig()
+
+    optional_params = config.map_openai_params(
+        non_default_params={
+            "thinking": {"type": "adaptive"},
+            "max_tokens": ANTHROPIC_MIN_THINKING_BUDGET_TOKENS,
+        },
+        optional_params={},
+        model="bedrock/converse/us.anthropic.claude-sonnet-4-5",
+        drop_params=False,
+    )
+
+    assert "thinking" not in optional_params
+
+
+def test_converse_usage_reports_unknown_split_for_signature_only_thinking():
+    config = AmazonConverseConfig()
+
+    usage = config.transform_usage(
+        ConverseTokenUsageBlock(inputTokens=32, outputTokens=581, totalTokens=613),
+        reasoning_content="",
+        thinking_ran=True,
+    )
+
+    assert usage.completion_tokens == 581
+    assert usage.completion_tokens_details is not None
+    assert usage.completion_tokens_details.reasoning_tokens is None
+    assert usage.completion_tokens_details.text_tokens is None
+
+
+def test_converse_usage_estimates_split_for_visible_thinking():
+    config = AmazonConverseConfig()
+
+    usage = config.transform_usage(
+        ConverseTokenUsageBlock(inputTokens=32, outputTokens=581, totalTokens=613),
+        reasoning_content="Let me think about how many primes there are under thirty.",
+        thinking_ran=True,
+    )
+
+    assert usage.completion_tokens_details is not None
+    assert usage.completion_tokens_details.reasoning_tokens > 0
+    assert (
+        usage.completion_tokens_details.reasoning_tokens + usage.completion_tokens_details.text_tokens
+        == usage.completion_tokens
+    )
+
+
+def test_converse_usage_without_thinking_reports_all_output_as_text():
+    config = AmazonConverseConfig()
+
+    usage = config.transform_usage(ConverseTokenUsageBlock(inputTokens=32, outputTokens=171, totalTokens=203))
+
+    assert usage.completion_tokens_details is not None
+    assert usage.completion_tokens_details.reasoning_tokens == 0
+    assert usage.completion_tokens_details.text_tokens == 171
+
+
+def test_converse_transform_response_signature_only_thinking_reports_unknown_split():
+    config = AmazonConverseConfig()
+    raw_response = MagicMock(status_code=200)
+    raw_response.text = json.dumps(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"reasoningText": {"text": "", "signature": "sig"}}},
+                        {"text": "10"},
+                    ],
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 32, "outputTokens": 581, "totalTokens": 613},
+        }
+    )
+    raw_response.json.return_value = json.loads(raw_response.text)
+
+    response = config._transform_response(
+        model="bedrock/global.anthropic.claude-opus-4-8",
+        response=raw_response,
+        model_response=ModelResponse(),
+        stream=False,
+        logging_obj=None,
+        optional_params={},
+        api_key=None,
+        data={},
+        messages=[],
+        encoding=None,
+    )
+
+    assert response.choices[0].message.reasoning_content == ""
+
+    assert response.usage.completion_tokens_details.reasoning_tokens is None
+    assert response.usage.completion_tokens_details.text_tokens is None
+
+
+def test_is_converse_usage_shape_distinguishes_camel_case_from_anthropic():
+    config = AmazonConverseConfig()
+    assert config.is_converse_usage_shape({"inputTokens": 1, "outputTokens": 2}) is True
+    assert config.is_converse_usage_shape({"outputTokens": 2}) is True
+    assert config.is_converse_usage_shape({"input_tokens": 1, "output_tokens": 2}) is False
+    assert config.is_converse_usage_shape({}) is False
+
+
+def test_usage_from_batch_output_completes_an_incomplete_block():
+    """Batch output omits totalTokens and the cache counts the live API always sends."""
+    usage = AmazonConverseConfig().usage_from_batch_output({"inputTokens": 2202, "outputTokens": 540})
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (2202, 540, 2742)
+
+
+def test_usage_from_batch_output_inflates_input_by_cache_counts():
+    usage = AmazonConverseConfig().usage_from_batch_output(
+        {
+            "inputTokens": 100,
+            "outputTokens": 20,
+            "totalTokens": 120,
+            "cacheReadInputTokens": 800,
+            "cacheWriteInputTokens": 200,
+        }
+    )
+    assert usage.prompt_tokens == 1100
+    assert usage.prompt_tokens_details.cached_tokens == 800
+    assert usage.prompt_tokens_details.cache_creation_tokens == 200
+
+
+def test_streaming_usage_chunk_is_transformed():
+    """The streaming decoder's usage event feeds the same public transform."""
+    from litellm.llms.bedrock.chat.invoke_handler import AWSEventStreamDecoder
+
+    decoder = AWSEventStreamDecoder(model="us.amazon.nova-lite-v1:0")
+    chunk = decoder.converse_chunk_parser({"usage": {"inputTokens": 11, "outputTokens": 4, "totalTokens": 15}})
+    assert chunk.usage.prompt_tokens == 11
+    assert chunk.usage.completion_tokens == 4
+    assert chunk.usage.total_tokens == 15
+
+
+def test_update_optional_params_with_thinking_tokens_bool_thinking_does_not_crash():
+    config = AmazonConverseConfig()
+    optional_params = {"thinking": True}
+    config.update_optional_params_with_thinking_tokens(
+        non_default_params={"thinking": True}, optional_params=optional_params
+    )
+    assert "maxTokens" not in optional_params
+
+
+
+@pytest.mark.parametrize(
+    "model, expected_dropped",
+    [
+        ("anthropic.claude-fable-5", True),
+        ("us.anthropic.claude-fable-5", True),
+        ("us.anthropic.claude-opus-4-8", False),
+    ],
+)
+def test_disabled_thinking_omitted_for_always_on_models_converse(
+    local_model_cost_map, model, expected_dropped
+):
+    """Bedrock Converse: ``thinking={"type": "disabled"}`` is omitted for always-on-thinking
+    models and forwarded verbatim for models that accept it."""
+    config = AmazonConverseConfig()
+
+    result = config._transform_request(
+        model=model,
+        messages=[{"role": "user", "content": "hi"}],
+        optional_params={"maxTokens": 64, "thinking": {"type": "disabled"}},
+        litellm_params={},
+        headers={},
+    )
+
+    additional = result.get("additionalModelRequestFields", {})
+    if expected_dropped:
+        assert "thinking" not in additional
+    else:
+        assert additional.get("thinking") == {"type": "disabled"}
