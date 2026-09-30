@@ -6,12 +6,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
 import pytest
+import pytest_asyncio
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 import litellm
+from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
 from litellm.llms.openai.common_utils import BaseOpenAILLM
 
 
@@ -210,11 +212,12 @@ def mtls_llm_endpoint(tmp_path_factory):
     server.server_close()
 
 
-@pytest.fixture(autouse=True)
-def _fresh_state():
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _fresh_state():
     litellm.in_memory_llm_clients_cache.flush_cache()
     _RecordingHandler.seen.clear()
     yield
+    await close_litellm_async_clients()
     litellm.in_memory_llm_clients_cache.flush_cache()
 
 
