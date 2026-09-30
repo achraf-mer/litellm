@@ -505,3 +505,35 @@ async def test_router_sends_the_token_only_to_the_deployment_that_configured_it(
     }
     assert by_deployment == {"/oauth/": {"Bearer gateway-jwt"}, "/static/": {"Bearer static-key"}}
     assert len(_LoopbackHandler.seen) - len(gateway_calls) == 1
+
+
+def _unapplied_call(loopback, call):
+    kwargs = {
+        "model": "openai/m",
+        "api_base": f"{loopback['gateway']}/oauth/v1",
+        "api_key": "unused",
+        "h2o_oauth": _config(token_url=loopback["token_url"]),
+        "num_retries": 0,
+    }
+    return (
+        call(**kwargs, input=["hi"])
+        if "embedding" in call.__name__
+        else call(**kwargs, messages=[{"role": "user", "content": "hi"}])
+    )
+
+
+@pytest.mark.parametrize("call", [litellm.completion, litellm.embedding])
+def test_sync_call_with_h2o_oauth_fails_closed_instead_of_sending_the_static_api_key(loopback, monkeypatch, call):
+    monkeypatch.setattr(litellm, "callbacks", [OAuthAuthHook()])
+    with pytest.raises(litellm.AuthenticationError, match="OAuth hook did not run"):
+        _unapplied_call(loopback, call)
+    assert _LoopbackHandler.seen == []
+
+
+@pytest.mark.parametrize("call", [litellm.acompletion, litellm.aembedding])
+@pytest.mark.asyncio
+async def test_async_call_with_h2o_oauth_but_no_registered_hook_fails_closed(loopback, monkeypatch, call):
+    monkeypatch.setattr(litellm, "callbacks", [])
+    with pytest.raises(litellm.AuthenticationError, match="OAuth hook did not run"):
+        await _unapplied_call(loopback, call)
+    assert _LoopbackHandler.seen == []
