@@ -1214,7 +1214,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         client: AsyncOpenAI | None = None,
         max_retries=None,
         shared_session: Optional["ClientSession"] = None,
-        litellm_params: Optional[Mapping[str, object]] = None,
+        litellm_params: Mapping[str, object] | None = None,
     ):
         try:
             openai_aclient: Final[AsyncOpenAI] = self._get_openai_client(
@@ -1288,7 +1288,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         aembedding=None,
         max_retries: int | None = None,
         shared_session: Optional["ClientSession"] = None,
-        litellm_params: Optional[Mapping[str, object]] = None,
+        litellm_params: Mapping[str, object] | None = None,
     ) -> EmbeddingResponse:
         super().embedding()
         try:

@@ -1,9 +1,7 @@
 import asyncio
 import datetime
 import json
-import os
 import ssl
-import sys
 import threading
 import time
 import urllib.parse
@@ -13,18 +11,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 import httpx
 import jwt
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.x509.oid import NameOID
 
-sys.path.insert(0, os.path.abspath("../../.."))
-
-import litellm  # noqa: E402
-from litellm.integrations.h2o.litellm_oauth_auth_hook import OAuthAuthHook  # noqa: E402
-
-pytest.importorskip("cryptography")
-
-from cryptography import x509  # noqa: E402
-from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import ec, rsa  # noqa: E402
-from cryptography.x509.oid import NameOID  # noqa: E402
+import litellm
+from litellm.integrations.h2o.litellm_oauth_auth_hook import OAuthAuthHook
 
 TOKEN_URL = "https://idp.example.com/oauth2/token"
 _SIGNING_KEY = ec.generate_private_key(ec.SECP256R1())
@@ -273,7 +266,9 @@ async def test_rs256_assertion_alg():
     ).decode()
     idp = _IdP()
     await _run(idp.hook(), h2o_oauth=_config(client_private_key=pem, assertion_alg="RS256"))
-    jwt.decode(idp.requests[0]["client_assertion"], rsa_key.public_key(), algorithms=["RS256"], audience=TOKEN_URL)
+    assertion = idp.requests[0]["client_assertion"]
+    assert jwt.get_unverified_header(assertion)["alg"] == "RS256"
+    assert jwt.decode(assertion, rsa_key.public_key(), algorithms=["RS256"], audience=TOKEN_URL)["sub"] == "h2ogpte"
 
 
 def _mint_cert(common_name: str, issuer: Optional[Tuple[rsa.RSAPrivateKey, x509.Certificate]] = None):

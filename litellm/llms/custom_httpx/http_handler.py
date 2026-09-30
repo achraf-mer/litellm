@@ -382,7 +382,7 @@ def get_client_cert_ssl_context(
     client_key: str | None = None,
 ) -> ssl.SSLContext:
     if isinstance(ssl_verify, ssl.SSLContext):
-        raise ValueError("client_cert cannot be combined with an ssl.SSLContext ssl_verify; pass a CA bundle path")
+        raise TypeError("client_cert cannot be combined with an ssl.SSLContext ssl_verify; pass a CA bundle path")
     resolved_verify: Final = get_ssl_verify(ssl_verify)
     context: Final = (
         _create_unverified_client_context()
@@ -1468,16 +1468,18 @@ class HTTPHandler:
             return getattr(litellm, "sync_transport", None)
 
 
-def _handler_params(params: dict) -> dict:
-    handler_params: Final = {
-        k: v for k, v in params.items() if k not in ("disable_aiohttp_transport", "client_cert", "client_key")
-    }
+_CACHE_KEY_ONLY_PARAMS: Final = frozenset(("disable_aiohttp_transport", "client_cert", "client_key"))
+
+
+def _handler_params(params: dict) -> dict:  # mutable-ok: the handlers are built from an untyped **params dict
     client_cert: Final = params.get("client_cert")
-    if not client_cert:
-        return handler_params
-    return {
-        **handler_params,
-        "ssl_verify": get_client_cert_ssl_context(params.get("ssl_verify"), client_cert, params.get("client_key")),
+    tls_override: Final = (
+        (("ssl_verify", get_client_cert_ssl_context(params.get("ssl_verify"), client_cert, params.get("client_key"))),)
+        if client_cert
+        else ()
+    )
+    return {  # mutable-ok: the handlers are built from an untyped **params dict
+        k: v for k, v in (*params.items(), *tls_override) if k not in _CACHE_KEY_ONLY_PARAMS
     }
 
 

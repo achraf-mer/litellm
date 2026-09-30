@@ -10,6 +10,7 @@ import ssl
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, Optional
 
 from typing_extensions import ReadOnly, TypedDict
@@ -38,7 +39,7 @@ from litellm.llms.custom_httpx.http_handler import (
 from litellm.types.llms.custom_http import VerifyTypes
 
 
-_GLOBAL_SESSION_CONFLICT = (
+_GLOBAL_SESSION_CONFLICT: Final = (
     "litellm.{attr} is set, so this deployment's client_cert would not be presented. "
     "Unset litellm.{attr} or remove client_cert from the deployment"
 )
@@ -311,10 +312,10 @@ class BaseOpenAILLM:
 
     @staticmethod
     def tls_client_kwargs(litellm_params: Mapping[str, object] | None) -> OpenAITLSClientKwargs:
-        params = litellm_params or {}
-        ssl_verify = params.get("ssl_verify")
-        client_cert = params.get("client_cert")
-        client_key = params.get("client_key")
+        params: Final = litellm_params or MappingProxyType({})
+        ssl_verify: Final = params.get("ssl_verify")
+        client_cert: Final = params.get("client_cert")
+        client_key: Final = params.get("client_key")
         return OpenAITLSClientKwargs(
             ssl_verify=ssl_verify if isinstance(ssl_verify, (bool, str, ssl.SSLContext)) else None,
             client_cert=client_cert if isinstance(client_cert, str) else None,

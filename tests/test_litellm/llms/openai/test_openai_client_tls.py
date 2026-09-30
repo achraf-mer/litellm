@@ -1,25 +1,18 @@
 import datetime
 import json
-import os
 import ssl
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
-sys.path.insert(0, os.path.abspath("../../../.."))
-
-import litellm  # noqa: E402
-from litellm.llms.openai.common_utils import BaseOpenAILLM  # noqa: E402
-
-pytest.importorskip("cryptography")
-
-from cryptography import x509  # noqa: E402
-from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
-from cryptography.x509.oid import NameOID  # noqa: E402
+import litellm
+from litellm.llms.openai.common_utils import BaseOpenAILLM
 
 
 def _cache_key(**overrides):
@@ -72,7 +65,7 @@ def test_ssl_verify_false_with_client_cert_disables_verification(mtls_llm_endpoi
 def test_client_cert_with_a_caller_supplied_sslcontext_is_refused():
     from litellm.llms.custom_httpx.http_handler import get_client_cert_ssl_context
 
-    with pytest.raises(ValueError, match="cannot be combined"):
+    with pytest.raises(TypeError, match="cannot be combined"):
         get_client_cert_ssl_context(ssl.create_default_context(), "/tmp/does-not-matter.pem")
 
 

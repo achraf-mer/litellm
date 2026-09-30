@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Per-deployment OAuth2 client_credentials (private_key_jwt) token, sent upstream as the deployment's api_key.
 
@@ -26,13 +25,16 @@ import asyncio
 import hashlib
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Union
+from types import MappingProxyType
+from typing import Final
 
 import httpx
 import jwt
 from pydantic import BaseModel, ConfigDict, ValidationError
+from typing_extensions import ReadOnly, TypedDict
 
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
@@ -40,11 +42,12 @@ from litellm.llms.custom_httpx.http_handler import get_client_cert_ssl_context, 
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.utils import CallTypes
 
-CONFIG_KEY = "h2o_oauth"
-REFRESH_BEFORE_EXPIRY_SEC = 30.0
-DEFAULT_EXPIRES_IN_SEC = 300.0
-ASSERTION_TTL_SEC = 60
-CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+CONFIG_KEY: Final = "h2o_oauth"
+REFRESH_BEFORE_EXPIRY_SEC: Final = 30.0
+DEFAULT_EXPIRES_IN_SEC: Final = 300.0
+ASSERTION_TTL_SEC: Final = 60
+CLIENT_ASSERTION_TYPE: Final = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+TOKEN_FETCH_ERRORS: Final = (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, TypeError)
 
 
 class OAuthConfig(BaseModel):
@@ -54,16 +57,25 @@ class OAuthConfig(BaseModel):
     client_id: str
     client_private_key: str
     assertion_alg: str = "ES256"
-    scope: Optional[str] = None
-    client_cert: Optional[str] = None
-    client_key: Optional[str] = None
-    ssl_verify: Optional[Union[bool, str]] = None
+    scope: str | None = None
+    client_cert: str | None = None
+    client_key: str | None = None
+    ssl_verify: bool | str | None = None
     timeout: float = 30.0
 
 
 class _TokenResponse(BaseModel):
     access_token: str
-    expires_in: Optional[float] = None
+    expires_in: float | None = None
+
+
+class _AssertionClaims(TypedDict):
+    iss: ReadOnly[str]
+    sub: ReadOnly[str]
+    aud: ReadOnly[str]
+    iat: ReadOnly[int]
+    exp: ReadOnly[int]
+    jti: ReadOnly[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,13 +86,18 @@ class _Token:
 
 def _resolve_secret(ref: str) -> str:
     if ref.startswith("os.environ/"):
-        value = get_secret_str(ref)
+        value: Final = get_secret_str(ref)
         if not value:
             raise ValueError(f"client_private_key references {ref}, which is unset")
         return value
     if ref.startswith("file://"):
         return Path(ref[len("file://") :]).read_text()
     return ref
+
+
+def _refresh_at(now: float, expires_in: float | None) -> float:
+    lifetime: Final = expires_in or DEFAULT_EXPIRES_IN_SEC
+    return now + max(lifetime - REFRESH_BEFORE_EXPIRY_SEC, lifetime / 2)
 
 
 def _describe_validation_error(error: ValidationError) -> str:
@@ -97,89 +114,91 @@ def _auth_error(message: str, model: str) -> litellm.AuthenticationError:
 class OAuthAuthHook(CustomLogger):
     def __init__(
         self,
-        transport: Optional[httpx.AsyncBaseTransport] = None,
+        transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         super().__init__()
         self._transport = transport
         self._clock = clock
-        self._tokens: Dict[str, _Token] = {}
-        self._inflight: Dict[str, "asyncio.Task[_Token]"] = {}
+        self._tokens: dict[str, _Token] = {}  # mutable-ok: per-process token cache, one entry per OAuth config
+        self._inflight: dict[str, asyncio.Task[_Token]] = {}  # mutable-ok: single-flight registry of token fetches
 
     async def async_pre_call_deployment_hook(
-        self, kwargs: Dict[str, object], call_type: Optional[CallTypes]
-    ) -> Optional[Dict[str, object]]:
-        raw_config = kwargs.get(CONFIG_KEY)
+        self,
+        kwargs: dict[str, object],  # mutable-ok: CustomLogger hook contract
+        call_type: CallTypes | None,
+    ) -> dict[str, object] | None:  # mutable-ok: CustomLogger hook contract returns the rewritten kwargs
+        raw_config: Final = kwargs.get(CONFIG_KEY)
         if raw_config is None:
             return None
-        model = str(kwargs.get("model", ""))
+        model: Final = str(kwargs.get("model", ""))
         try:
-            config = OAuthConfig.model_validate(raw_config)
+            config: Final = OAuthConfig.model_validate(raw_config)
         except ValidationError as e:
             raise _auth_error(f"invalid h2o_oauth config: {_describe_validation_error(e)}", model) from None
         try:
-            token = await self._get_token(config)
+            token: Final = await self._get_token(config)
         except ValidationError as e:
             raise _auth_error(f"unexpected token endpoint response: {_describe_validation_error(e)}", model) from None
-        except Exception as e:
+        except TOKEN_FETCH_ERRORS as e:
             raise _auth_error(f"could not obtain an h2o_oauth token: {type(e).__name__}: {e}", model) from None
-        return {**{k: v for k, v in kwargs.items() if k != CONFIG_KEY}, "api_key": token}
+        return {  # mutable-ok: CustomLogger hook contract returns the rewritten kwargs
+            k: v for k, v in (*kwargs.items(), ("api_key", token)) if k != CONFIG_KEY
+        }
 
     async def _get_token(self, config: OAuthConfig) -> str:
-        key = hashlib.sha256(config.model_dump_json().encode()).hexdigest()
-        cached = self._tokens.get(key)
+        key: Final = hashlib.sha256(config.model_dump_json().encode()).hexdigest()
+        cached: Final = self._tokens.get(key)
         if cached is not None and self._clock() < cached.refresh_at:
             return cached.value
-        task = self._inflight.get(key)
-        if task is None or task.get_loop() is not asyncio.get_running_loop():
-            task = asyncio.ensure_future(self._refresh(key, config))
-            self._inflight[key] = task
+        inflight: Final = self._inflight.get(key)
+        if inflight is not None and inflight.get_loop() is asyncio.get_running_loop():
+            return (await asyncio.shield(inflight)).value
+        task: Final = asyncio.ensure_future(self._refresh(key, config))
+        self._inflight[key] = task
         return (await asyncio.shield(task)).value
 
     async def _refresh(self, key: str, config: OAuthConfig) -> _Token:
         try:
-            token = await self._fetch(config)
+            token: Final = await self._fetch(config)
             self._tokens[key] = token
             return token
         finally:
             self._inflight.pop(key, None)
 
     async def _fetch(self, config: OAuthConfig) -> _Token:
-        now = self._clock()
-        assertion = jwt.encode(
-            {
-                "iss": config.client_id,
-                "sub": config.client_id,
-                "aud": config.token_url,
-                "iat": int(now),
-                "exp": int(now) + ASSERTION_TTL_SEC,
-                "jti": str(uuid.uuid4()),
-            },
+        now: Final = self._clock()
+        claims: Final[_AssertionClaims] = {
+            "iss": config.client_id,
+            "sub": config.client_id,
+            "aud": config.token_url,
+            "iat": int(now),
+            "exp": int(now) + ASSERTION_TTL_SEC,
+            "jti": str(uuid.uuid4()),
+        }
+        assertion: Final = jwt.encode(
+            dict(claims),  # mutable-ok: PyJWT's encode takes a dict payload
             _resolve_secret(config.client_private_key),
             algorithm=config.assertion_alg,
         )
-        form = {
-            "grant_type": "client_credentials",
-            "client_id": config.client_id,
-            "client_assertion_type": CLIENT_ASSERTION_TYPE,
-            "client_assertion": assertion,
-            **({"scope": config.scope} if config.scope else {}),
-        }
-        verify = (
+        form: Final = (
+            ("grant_type", "client_credentials"),
+            ("client_id", config.client_id),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", assertion),
+            *((("scope", config.scope),) if config.scope else ()),
+        )
+        verify: Final = (
             get_client_cert_ssl_context(config.ssl_verify, config.client_cert, config.client_key)
             if config.client_cert
             else get_ssl_configuration(config.ssl_verify)
         )
         async with httpx.AsyncClient(verify=verify, timeout=config.timeout, transport=self._transport) as client:
-            response = await client.post(config.token_url, data=form)
+            response: Final = await client.post(config.token_url, data=MappingProxyType(dict(form)))
         if response.status_code != 200:
             raise ValueError(f"token endpoint returned {response.status_code}: {response.text[:200]}")
-        body = _TokenResponse.model_validate_json(response.content)
-        expires_in = body.expires_in or DEFAULT_EXPIRES_IN_SEC
-        return _Token(
-            value=body.access_token,
-            refresh_at=now + max(expires_in - REFRESH_BEFORE_EXPIRY_SEC, expires_in / 2),
-        )
+        body: Final = _TokenResponse.model_validate_json(response.content)
+        return _Token(value=body.access_token, refresh_at=_refresh_at(now, body.expires_in))
 
 
-oauth_auth_hook = OAuthAuthHook()
+oauth_auth_hook: Final = OAuthAuthHook()

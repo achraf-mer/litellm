@@ -252,9 +252,14 @@ def _custom_logger_callbacks(logging_obj: LiteLLMLoggingObj) -> list["CustomLogg
     return custom_loggers
 
 
-def _tls_client_params(litellm_params: GenericLiteLLMParams) -> dict[str, object]:
-    optional: Final = {key: litellm_params.get(key) for key in ("client_cert", "client_key") if litellm_params.get(key)}
-    return {"ssl_verify": litellm_params.get("ssl_verify", None), **optional}
+def _tls_client_params(
+    litellm_params: GenericLiteLLMParams,
+) -> dict[str, object]:  # mutable-ok: the httpx client factories take a plain params dict
+    return {  # mutable-ok: the httpx client factories take a plain params dict
+        key: litellm_params.get(key)
+        for key in ("ssl_verify", "client_cert", "client_key")
+        if key == "ssl_verify" or litellm_params.get(key)
+    }
 
 
 def _has_pre_call_deployment_hook(logging_obj: LiteLLMLoggingObj) -> bool:
@@ -2583,10 +2588,11 @@ class BaseLLMHTTPHandler:
             logging_obj=logging_obj,
         )
 
-        if client is None or not isinstance(client, HTTPHandler):
-            sync_httpx_client = _get_httpx_client(params=_tls_client_params(litellm_params))
-        else:
-            sync_httpx_client = client
+        sync_httpx_client: Final = (
+            _get_httpx_client(params=_tls_client_params(litellm_params))
+            if client is None or not isinstance(client, HTTPHandler)
+            else client
+        )
 
         headers = responses_api_provider_config.validate_environment(
             headers=response_api_optional_request_params.get("extra_headers", {}) or {},
