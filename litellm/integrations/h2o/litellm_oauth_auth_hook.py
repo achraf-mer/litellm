@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Literal
 
 import httpx
 import jwt
@@ -50,6 +50,8 @@ ASSERTION_TTL_SEC: Final = 60
 CLIENT_ASSERTION_TYPE: Final = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 TOKEN_FETCH_ERRORS: Final = (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, TypeError)
 
+AssertionAlg = Literal["ES256", "ES384", "ES512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "EdDSA"]
+
 
 class OAuthConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -57,7 +59,7 @@ class OAuthConfig(BaseModel):
     token_url: str
     client_id: str
     client_private_key: str
-    assertion_alg: str = "ES256"
+    assertion_alg: AssertionAlg = "ES256"
     scope: str | None = None
     client_cert: str | None = None
     client_key: str | None = None

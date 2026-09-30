@@ -291,6 +291,15 @@ async def test_rs256_assertion_alg():
     assert jwt.decode(assertion, rsa_key.public_key(), algorithms=["RS256"], audience=TOKEN_URL)["sub"] == "h2ogpte"
 
 
+@pytest.mark.parametrize("alg", ["HS256", "none", "es256"])
+@pytest.mark.asyncio
+async def test_non_asymmetric_or_misspelled_assertion_alg_is_rejected_before_any_request(alg):
+    idp = _IdP()
+    with pytest.raises(litellm.AuthenticationError, match="invalid h2o_oauth config: assertion_alg"):
+        await _run(idp.hook(), h2o_oauth=_config(assertion_alg=alg))
+    assert idp.requests == []
+
+
 def _mint_cert(common_name: str, issuer: Optional[Tuple[rsa.RSAPrivateKey, x509.Certificate]] = None):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
