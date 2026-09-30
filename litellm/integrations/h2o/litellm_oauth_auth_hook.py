@@ -96,7 +96,7 @@ def _resolve_secret(ref: str) -> str:
 
 
 def _refresh_at(now: float, expires_in: float | None) -> float:
-    lifetime: Final = expires_in or DEFAULT_EXPIRES_IN_SEC
+    lifetime: Final = DEFAULT_EXPIRES_IN_SEC if expires_in is None else expires_in
     return now + max(lifetime - REFRESH_BEFORE_EXPIRY_SEC, lifetime / 2)
 
 

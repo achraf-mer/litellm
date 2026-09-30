@@ -124,7 +124,7 @@ async def test_each_assertion_has_a_unique_jti():
 )
 @pytest.mark.asyncio
 async def test_token_is_cached_until_shortly_before_expiry(expires_in, refresh_after):
-    body = {"access_token": "tok", **({"expires_in": expires_in} if expires_in else {})}
+    body = {"access_token": "tok", **({"expires_in": expires_in} if expires_in is not None else {})}
     idp = _IdP(lambda n: httpx.Response(200, json={**body, "access_token": f"tok-{n}"}))
     clock = _Clock()
     hook = idp.hook(clock)
@@ -136,6 +136,15 @@ async def test_token_is_cached_until_shortly_before_expiry(expires_in, refresh_a
     clock.now = start + refresh_after
     assert (await _run(hook, h2o_oauth=_config()))["api_key"] == "tok-2"
     assert len(idp.requests) == 2
+
+
+@pytest.mark.parametrize("expires_in", [0, -5])
+@pytest.mark.asyncio
+async def test_an_already_expired_token_is_not_cached(expires_in):
+    idp = _IdP(lambda n: httpx.Response(200, json={"access_token": f"tok-{n}", "expires_in": expires_in}))
+    hook = idp.hook()
+    assert (await _run(hook, h2o_oauth=_config()))["api_key"] == "tok-1"
+    assert (await _run(hook, h2o_oauth=_config()))["api_key"] == "tok-2"
 
 
 @pytest.mark.asyncio
