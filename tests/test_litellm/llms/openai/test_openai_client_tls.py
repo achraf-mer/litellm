@@ -5,14 +5,16 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
+import httpx
 import pytest
 import pytest_asyncio
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
 import litellm
+from litellm.integrations.h2o.litellm_oauth_auth_hook import OAuthAuthHook
 from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
 from litellm.llms.openai.common_utils import BaseOpenAILLM
 
@@ -121,7 +123,14 @@ class _RecordingHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0) or 0)))
         peer = self.connection.getpeercert() or {}
         common_name = dict(pair[0] for pair in peer.get("subject", ()))["commonName"]
-        _RecordingHandler.seen.append({"path": self.path, "peer_cn": common_name, "body_keys": sorted(body)})
+        _RecordingHandler.seen.append(
+            {
+                "path": self.path,
+                "peer_cn": common_name,
+                "body_keys": sorted(body),
+                "authorization": self.headers.get("authorization"),
+            }
+        )
         if self.path.endswith("/responses"):
             response = {
                 "id": "resp_1",
@@ -347,3 +356,61 @@ async def test_global_http_client_is_still_used_without_client_cert(mtls_llm_end
     response = await _call(is_async, api_base=mtls_llm_endpoint["api_base"], api_key="unused")
     assert response.choices[0].message.content == "mtls-ok"
     assert [request["peer_cn"] for request in _RecordingHandler.seen] == ["localhost"]
+
+
+_MESSAGES = [{"role": "user", "content": "hi"}]
+_OAUTH = {
+    "token_url": "https://idp.invalid/token",
+    "client_id": "h2ogpte",
+    "client_private_key": _key_pem(ec.generate_private_key(ec.SECP256R1())).decode(),
+}
+_OAUTH_CALLS = {
+    "acompletion": lambda kw: litellm.acompletion(model="openai/gw-model", messages=_MESSAGES, **kw),
+    "acompletion-stream": lambda kw: litellm.acompletion(model="openai/gw-model", messages=_MESSAGES, **kw),
+    "aembedding": lambda kw: litellm.aembedding(model="openai/gw-embed", input=["hi"], **kw),
+    "aresponses": lambda kw: litellm.aresponses(model="openai/gw-model", input="hi", **kw),
+    "anthropic_messages": lambda kw: litellm.anthropic_messages(
+        model="openai/gw-model", messages=_MESSAGES, max_tokens=5, **kw
+    ),
+}
+
+
+def _oauth_hook() -> OAuthAuthHook:
+    return OAuthAuthHook(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"access_token": "minted-jwt", "expires_in": 3600})
+        )
+    )
+
+
+def _oauth_deployment(endpoint: dict) -> dict:
+    return {**_tls_kwargs(endpoint), "h2o_oauth": _OAUTH}
+
+
+def _gateway_saw() -> list:
+    return [(request["peer_cn"], request["authorization"]) for request in _RecordingHandler.seen]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", list(_OAUTH_CALLS))
+async def test_oauth_token_reaches_the_gateway_together_with_the_client_cert(mtls_llm_endpoint, monkeypatch, call):
+    monkeypatch.setattr(litellm, "callbacks", [_oauth_hook()])
+    await _OAUTH_CALLS[call]({**_oauth_deployment(mtls_llm_endpoint), **({"stream": True} if "stream" in call else {})})
+    assert _gateway_saw() == [("h2ogpte-client", "Bearer minted-jwt")]
+
+
+def test_sync_responses_sends_the_oauth_token_together_with_the_client_cert(mtls_llm_endpoint, monkeypatch):
+    monkeypatch.setattr(litellm, "callbacks", [_oauth_hook()])
+    litellm.responses(model="openai/gw-model", input="hi", **_oauth_deployment(mtls_llm_endpoint))
+    assert _gateway_saw() == [("h2ogpte-client", "Bearer minted-jwt")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["hosted_vllm/gw-model", "anthropic/claude-sonnet-4-5"])
+async def test_oauth_token_is_not_sent_by_a_provider_that_drops_the_client_cert(mtls_llm_endpoint, monkeypatch, model):
+    monkeypatch.setattr(litellm, "callbacks", [_oauth_hook()])
+    with pytest.raises(litellm.AuthenticationError, match="client_cert is only presented on openai/"):
+        await litellm.acompletion(
+            model=model, messages=_MESSAGES, max_tokens=5, num_retries=0, **_oauth_deployment(mtls_llm_endpoint)
+        )
+    assert _RecordingHandler.seen == []

@@ -48,11 +48,10 @@ REFRESH_BEFORE_EXPIRY_SEC: Final = 30.0
 DEFAULT_EXPIRES_IN_SEC: Final = 300.0
 ASSERTION_TTL_SEC: Final = 60
 CLIENT_ASSERTION_TYPE: Final = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+CLIENT_CERT_PROVIDER: Final = "openai"
 CLIENT_CERT_CALL_TYPES: Final = frozenset(
     (
-        CallTypes.completion,
         CallTypes.acompletion,
-        CallTypes.embedding,
         CallTypes.aembedding,
         CallTypes.responses,
         CallTypes.aresponses,
@@ -114,6 +113,18 @@ def _refresh_at(now: float, expires_in: float | None) -> float:
     return now + max(lifetime - REFRESH_BEFORE_EXPIRY_SEC, lifetime / 2)
 
 
+def _presents_client_cert(model: str, custom_llm_provider: object, call_type: CallTypes | None) -> bool:
+    if call_type not in CLIENT_CERT_CALL_TYPES:
+        return False
+    try:
+        _, provider, _, _ = litellm.get_llm_provider(
+            model=model, custom_llm_provider=custom_llm_provider if isinstance(custom_llm_provider, str) else None
+        )
+    except litellm.BadRequestError:
+        return False
+    return provider == CLIENT_CERT_PROVIDER
+
+
 def _describe_validation_error(error: ValidationError) -> str:
     return "; ".join(
         f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}"
@@ -146,10 +157,10 @@ class OAuthAuthHook(CustomLogger):
         if raw_config is None:
             return None
         model: Final = str(kwargs.get("model", ""))
-        if kwargs.get("client_cert") and call_type not in CLIENT_CERT_CALL_TYPES:
+        if kwargs.get("client_cert") and not _presents_client_cert(model, kwargs.get("custom_llm_provider"), call_type):
             raise _auth_error(
-                f"the deployment's client_cert is not presented on {call_type.value if call_type else 'unknown'} "
-                "calls, so the h2o_oauth token is not sent without it",
+                "the deployment's client_cert is only presented on openai/ chat, embeddings, responses and "
+                "/v1/messages calls, so the h2o_oauth token is not sent without it",
                 model,
             )
         try:
