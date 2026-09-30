@@ -2164,7 +2164,7 @@ class TestIsRequestBodySafeBlocksEndpointTargetingFields:
         ],
     )
     def test_deployment_transport_and_oauth_config_in_request_body_is_rejected(self, field, value):
-        with pytest.raises(ValueError) as exc:
+        with pytest.raises(ValueError, match="Rejected Request") as exc:
             is_request_body_safe(
                 request_body={"model": "gpt-4", field: value},
                 general_settings={},

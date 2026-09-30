@@ -13,8 +13,6 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, Optional
 
-from typing_extensions import ReadOnly, TypedDict
-
 import httpx
 import openai
 from openai import AsyncAzureOpenAI, AsyncOpenAI, AzureOpenAI, OpenAI
@@ -23,6 +21,7 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
 from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from openai.types.completion_usage import CompletionUsage
+from typing_extensions import ReadOnly, TypedDict
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
@@ -37,7 +36,6 @@ from litellm.llms.custom_httpx.http_handler import (
     get_ssl_configuration,
 )
 from litellm.types.llms.custom_http import VerifyTypes
-
 
 _GLOBAL_SESSION_CONFLICT: Final = (
     "litellm.{attr} is set, so this deployment's client_cert would not be presented. "
