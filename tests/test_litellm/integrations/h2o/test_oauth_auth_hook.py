@@ -20,6 +20,7 @@ from cryptography.x509.oid import NameOID
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.h2o.litellm_oauth_auth_hook import OAuthAuthHook
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
 from litellm.types.utils import CallTypes
 
@@ -523,16 +524,18 @@ _UNAPPLIED_CALLS = {
 }
 
 
+def _unapplied_kwargs(loopback) -> dict:
+    return {
+        "model": "openai/m",
+        "api_base": f"{loopback['gateway']}/oauth/v1",
+        "api_key": "unused",
+        "h2o_oauth": _config(token_url=loopback["token_url"]),
+        "num_retries": 0,
+    }
+
+
 def _unapplied_call(loopback, call: str):
-    return _UNAPPLIED_CALLS[call](
-        {
-            "model": "openai/m",
-            "api_base": f"{loopback['gateway']}/oauth/v1",
-            "api_key": "unused",
-            "h2o_oauth": _config(token_url=loopback["token_url"]),
-            "num_retries": 0,
-        }
-    )
+    return _UNAPPLIED_CALLS[call](_unapplied_kwargs(loopback))
 
 
 @pytest.mark.parametrize("call", ["completion", "embedding", "transcription"])
@@ -540,6 +543,23 @@ def test_sync_call_with_h2o_oauth_fails_closed_instead_of_sending_the_static_api
     monkeypatch.setattr(litellm, "callbacks", [OAuthAuthHook()])
     with pytest.raises(litellm.AuthenticationError, match="OAuth hook did not run"):
         _unapplied_call(loopback, call)
+    assert _LoopbackHandler.seen == []
+
+
+@pytest.mark.parametrize("call, flag", [("completion", "acompletion"), ("embedding", "aembedding")])
+def test_internal_async_flagged_sync_call_with_h2o_oauth_fails_closed(loopback, monkeypatch, call, flag):
+    monkeypatch.setattr(litellm, "callbacks", [])
+    logging_obj = Logging(
+        model="openai/m",
+        messages=_MESSAGES,
+        stream=False,
+        call_type=flag,
+        start_time=datetime.datetime.now(),
+        litellm_call_id="call-id",
+        function_id="function-id",
+    )
+    with pytest.raises(litellm.AuthenticationError, match="OAuth hook did not run"):
+        _UNAPPLIED_CALLS[call]({**_unapplied_kwargs(loopback), flag: True, "litellm_logging_obj": logging_obj})
     assert _LoopbackHandler.seen == []
 
 

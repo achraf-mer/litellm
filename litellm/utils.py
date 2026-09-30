@@ -1360,6 +1360,8 @@ def client(original_function):
         # DO NOT MOVE THIS. It always needs to run first
         # Check if this is an async function. If so only execute the async function
         call_type = original_function.__name__
+        if call_type != CallTypes.responses.value:
+            reject_unapplied_h2o_oauth(kwargs.get("h2o_oauth"), kwargs.get("model"))
         if _is_async_request(kwargs):
             # [OPTIONAL] CHECK MAX RETRIES / REQUEST
             if litellm.num_retries_per_request is not None:
@@ -1405,8 +1407,6 @@ def client(original_function):
 
             # Type assertion: logging_obj is guaranteed to be non-None after function_setup
             assert logging_obj is not None, "logging_obj should not be None after function_setup"
-            if call_type != CallTypes.responses.value:
-                reject_unapplied_h2o_oauth(kwargs.get("h2o_oauth"), model)
 
             ## LOAD CREDENTIALS
             load_credentials_from_list(kwargs)
