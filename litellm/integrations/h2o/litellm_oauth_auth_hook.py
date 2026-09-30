@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from typing_extensions import ReadOnly, TypedDict
 
 import litellm
+from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.llms.custom_httpx.http_handler import get_client_cert_ssl_context, get_ssl_configuration
 from litellm.secret_managers.main import get_secret_str
@@ -196,7 +197,8 @@ class OAuthAuthHook(CustomLogger):
         async with httpx.AsyncClient(verify=verify, timeout=config.timeout, transport=self._transport) as client:
             response: Final = await client.post(config.token_url, data=MappingProxyType(dict(form)))
         if response.status_code != 200:
-            raise ValueError(f"token endpoint returned {response.status_code}: {response.text[:200]}")
+            verbose_logger.debug("h2o_oauth token endpoint returned %s: %s", response.status_code, response.text[:200])
+            raise ValueError(f"token endpoint returned {response.status_code}")
         body: Final = _TokenResponse.model_validate_json(response.content)
         return _Token(value=body.access_token, refresh_at=_refresh_at(now, body.expires_in))
 

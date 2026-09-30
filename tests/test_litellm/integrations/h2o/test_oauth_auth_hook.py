@@ -225,6 +225,15 @@ async def test_token_failures_fail_closed_with_an_authentication_error(response,
 
 
 @pytest.mark.asyncio
+async def test_token_endpoint_error_body_is_not_returned_to_the_caller():
+    hook = _IdP(lambda n: httpx.Response(400, json={"error_description": "client h2ogpte is locked"})).hook()
+    with pytest.raises(litellm.AuthenticationError) as exc:
+        await _run(hook, model="openai/x", h2o_oauth=_config())
+    assert "token endpoint returned 400" in str(exc.value)
+    assert "locked" not in str(exc.value)
+
+
+@pytest.mark.asyncio
 async def test_invalid_config_error_never_echoes_the_private_key():
     idp = _IdP()
     with pytest.raises(litellm.AuthenticationError) as exc:
