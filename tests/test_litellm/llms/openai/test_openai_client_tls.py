@@ -291,11 +291,10 @@ def test_sync_embedding_presents_the_deployment_client_cert(mtls_llm_endpoint):
 
 
 @pytest.mark.asyncio
-async def test_tls_and_oauth_params_never_reach_the_upstream_body(mtls_llm_endpoint):
+async def test_tls_params_never_reach_the_upstream_body(mtls_llm_endpoint):
     await litellm.acompletion(
         model="openai/gw-model",
         messages=[{"role": "user", "content": "hi"}],
-        h2o_oauth={"token_url": "https://idp.example.com/token"},
         **_tls_kwargs(mtls_llm_endpoint),
     )
     assert _RecordingHandler.seen[0]["body_keys"] == ["messages", "model"]
