@@ -146,6 +146,7 @@ from litellm.utils import (
     ModelResponse,
     ProviderConfigManager,
     async_pre_call_deployment_hook,
+    reject_unapplied_h2o_oauth,
 )
 
 
@@ -2465,6 +2466,7 @@ class BaseLLMHTTPHandler:
         GenericLiteLLMParams,
     ]:
         if not _has_pre_call_deployment_hook(logging_obj):
+            reject_unapplied_h2o_oauth(litellm_params.get("h2o_oauth"), model)
             return (
                 model,
                 input,
@@ -2484,6 +2486,8 @@ class BaseLLMHTTPHandler:
             },
             CallTypes.responses.value,
         )
+        if modified_kwargs is not None:
+            reject_unapplied_h2o_oauth(modified_kwargs.get("h2o_oauth"), model)
         if modified_kwargs is None:
             return (
                 model,

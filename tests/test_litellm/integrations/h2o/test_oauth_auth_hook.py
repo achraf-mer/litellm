@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
 import litellm
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.h2o.litellm_oauth_auth_hook import OAuthAuthHook
 from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
 from litellm.types.utils import CallTypes
@@ -507,22 +508,34 @@ async def test_router_sends_the_token_only_to_the_deployment_that_configured_it(
     assert len(_LoopbackHandler.seen) - len(gateway_calls) == 1
 
 
-def _unapplied_call(loopback, call):
-    kwargs = {
-        "model": "openai/m",
-        "api_base": f"{loopback['gateway']}/oauth/v1",
-        "api_key": "unused",
-        "h2o_oauth": _config(token_url=loopback["token_url"]),
-        "num_retries": 0,
-    }
-    return (
-        call(**kwargs, input=["hi"])
-        if "embedding" in call.__name__
-        else call(**kwargs, messages=[{"role": "user", "content": "hi"}])
+_MESSAGES = [{"role": "user", "content": "hi"}]
+_AUDIO = ("clip.wav", b"RIFF0000WAVE", "audio/wav")
+_UNAPPLIED_CALLS = {
+    "completion": lambda kw: litellm.completion(messages=_MESSAGES, **kw),
+    "embedding": lambda kw: litellm.embedding(input=["hi"], **kw),
+    "responses": lambda kw: litellm.responses(input="hi", **kw),
+    "transcription": lambda kw: litellm.transcription(file=_AUDIO, **kw),
+    "acompletion": lambda kw: litellm.acompletion(messages=_MESSAGES, **kw),
+    "aembedding": lambda kw: litellm.aembedding(input=["hi"], **kw),
+    "aresponses": lambda kw: litellm.aresponses(input="hi", **kw),
+    "anthropic_messages": lambda kw: litellm.anthropic_messages(messages=_MESSAGES, max_tokens=5, **kw),
+    "atranscription": lambda kw: litellm.atranscription(file=_AUDIO, **kw),
+}
+
+
+def _unapplied_call(loopback, call: str):
+    return _UNAPPLIED_CALLS[call](
+        {
+            "model": "openai/m",
+            "api_base": f"{loopback['gateway']}/oauth/v1",
+            "api_key": "unused",
+            "h2o_oauth": _config(token_url=loopback["token_url"]),
+            "num_retries": 0,
+        }
     )
 
 
-@pytest.mark.parametrize("call", [litellm.completion, litellm.embedding])
+@pytest.mark.parametrize("call", ["completion", "embedding", "transcription"])
 def test_sync_call_with_h2o_oauth_fails_closed_instead_of_sending_the_static_api_key(loopback, monkeypatch, call):
     monkeypatch.setattr(litellm, "callbacks", [OAuthAuthHook()])
     with pytest.raises(litellm.AuthenticationError, match="OAuth hook did not run"):
@@ -530,7 +543,20 @@ def test_sync_call_with_h2o_oauth_fails_closed_instead_of_sending_the_static_api
     assert _LoopbackHandler.seen == []
 
 
-@pytest.mark.parametrize("call", [litellm.acompletion, litellm.aembedding])
+class _OtherDeploymentHook(CustomLogger):
+    async def async_pre_call_deployment_hook(self, kwargs, call_type):
+        return None
+
+
+@pytest.mark.parametrize("callbacks", [[], [_OtherDeploymentHook()]], ids=["no-hook", "other-deployment-hook"])
+def test_sync_responses_with_h2o_oauth_but_no_oauth_hook_fails_closed(loopback, monkeypatch, callbacks):
+    monkeypatch.setattr(litellm, "callbacks", callbacks)
+    with pytest.raises(litellm.AuthenticationError, match="OAuth hook did not run"):
+        _unapplied_call(loopback, "responses")
+    assert _LoopbackHandler.seen == []
+
+
+@pytest.mark.parametrize("call", ["acompletion", "aembedding", "aresponses", "anthropic_messages", "atranscription"])
 @pytest.mark.asyncio
 async def test_async_call_with_h2o_oauth_but_no_registered_hook_fails_closed(loopback, monkeypatch, call):
     monkeypatch.setattr(litellm, "callbacks", [])

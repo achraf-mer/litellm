@@ -1142,17 +1142,6 @@ def _provider_config_items(config: Mapping[str, object]) -> Iterable[tuple[str, 
     return config.items()
 
 
-def _reject_unapplied_h2o_oauth(kwargs: Mapping[str, object], model: str) -> None:
-    if kwargs.get("h2o_oauth") is None:
-        return
-    raise litellm.AuthenticationError(
-        message="h2o_oauth is set but the h2o OAuth hook did not run. Register "
-        "litellm.integrations.h2o.litellm_oauth_auth_hook.oauth_auth_hook as a callback and call the async API",
-        llm_provider="h2o_oauth",
-        model=model,
-    )
-
-
 def _locals_snapshot(values: Mapping[str, object]) -> Mapping[str, object]:
     return values
 
@@ -5012,7 +5001,6 @@ def completion(
     ### VALIDATE Request ###
     if model is None:
         raise ValueError("model param not passed in.")
-    _reject_unapplied_h2o_oauth(kwargs, model)
     # validate messages
     messages = validate_and_fix_openai_messages(messages=messages)
     tools = validate_and_fix_openai_tools(tools=tools)
@@ -6081,7 +6069,6 @@ def embedding(
     Raises:
     - exception_type: If an exception occurs during the API call.
     """
-    _reject_unapplied_h2o_oauth(kwargs, model)
     azure: Final = kwargs.get("azure", None)
     client: Final = kwargs.pop("client", None)
     shared_session: Final = kwargs.get("shared_session", None)
