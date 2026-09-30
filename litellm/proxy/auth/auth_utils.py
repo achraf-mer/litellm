@@ -312,9 +312,6 @@ _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
     "nvcf_function_id",
     "use_ssl",
     "ssl_verify",
-    "client_cert",
-    "client_key",
-    "h2o_oauth",
     # Per-deployment opt-in that hands the whole call to the Rust core. It is a
     # deployment decision, not a request one: the Rust path uses its own client
     # rather than the one the deployment configured, and reports no post_call,
@@ -333,6 +330,9 @@ _BANNED_REQUEST_BODY_PARAMS: Final[tuple[str, ...]] = (
 )
 
 
+_SERVER_SIDE_REFERENCE_PARAMS: Final = ("h2o_oauth", "client_cert", "client_key")
+
+
 def _check_banned_params(
     body: dict,
     general_settings: dict,
@@ -344,6 +344,9 @@ def _check_banned_params(
     Shared between the root-level check and the nested-config check so a
     new banned param only needs to be added in one place.
     """
+    for param in _SERVER_SIDE_REFERENCE_PARAMS:
+        if param in body:
+            raise ValueError(f"Rejected Request: {param} is not allowed in request body.")
     for param in _BANNED_REQUEST_BODY_PARAMS:
         if param not in body:
             continue
