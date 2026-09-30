@@ -20,6 +20,7 @@ from cryptography.x509.oid import NameOID
 import litellm
 from litellm.integrations.h2o.litellm_oauth_auth_hook import OAuthAuthHook
 from litellm.llms.custom_httpx.async_client_cleanup import close_litellm_async_clients
+from litellm.types.utils import CallTypes
 
 TOKEN_URL = "https://idp.example.com/oauth2/token"
 _SIGNING_KEY = ec.generate_private_key(ec.SECP256R1())
@@ -77,6 +78,32 @@ async def test_token_becomes_api_key_and_config_is_stripped():
     idp = _IdP()
     result = await _run(idp.hook(), model="openai/x", api_key="unused", messages=[], h2o_oauth=_config())
     assert result == {"model": "openai/x", "api_key": "tok-1", "messages": []}
+
+
+@pytest.mark.parametrize("call_type", [CallTypes.atranscription, CallTypes.atext_completion, None])
+@pytest.mark.asyncio
+async def test_no_token_is_sent_on_a_call_type_that_drops_the_deployment_client_cert(call_type):
+    idp = _IdP()
+    with pytest.raises(litellm.AuthenticationError, match="client_cert is not presented"):
+        await idp.hook().async_pre_call_deployment_hook(
+            {"model": "openai/x", "client_cert": "/certs/tls.crt", "h2o_oauth": _config()}, call_type
+        )
+    assert idp.requests == []
+
+
+@pytest.mark.parametrize(
+    "call_type, client_cert",
+    [
+        (CallTypes.acompletion, "/certs/tls.crt"),
+        (CallTypes.anthropic_messages, "/certs/tls.crt"),
+        (CallTypes.atranscription, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_token_is_sent_when_the_call_type_presents_the_client_cert_or_none_is_configured(call_type, client_cert):
+    kwargs = {"model": "openai/x", "client_cert": client_cert, "h2o_oauth": _config()}
+    result = await _IdP().hook().async_pre_call_deployment_hook(kwargs, call_type)
+    assert result["api_key"] == "tok-1"
 
 
 @pytest.mark.asyncio

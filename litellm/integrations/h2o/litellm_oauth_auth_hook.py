@@ -48,6 +48,17 @@ REFRESH_BEFORE_EXPIRY_SEC: Final = 30.0
 DEFAULT_EXPIRES_IN_SEC: Final = 300.0
 ASSERTION_TTL_SEC: Final = 60
 CLIENT_ASSERTION_TYPE: Final = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+CLIENT_CERT_CALL_TYPES: Final = frozenset(
+    (
+        CallTypes.completion,
+        CallTypes.acompletion,
+        CallTypes.embedding,
+        CallTypes.aembedding,
+        CallTypes.responses,
+        CallTypes.aresponses,
+        CallTypes.anthropic_messages,
+    )
+)
 TOKEN_FETCH_ERRORS: Final = (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, TypeError)
 
 AssertionAlg = Literal["ES256", "ES384", "ES512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "EdDSA"]
@@ -135,6 +146,12 @@ class OAuthAuthHook(CustomLogger):
         if raw_config is None:
             return None
         model: Final = str(kwargs.get("model", ""))
+        if kwargs.get("client_cert") and call_type not in CLIENT_CERT_CALL_TYPES:
+            raise _auth_error(
+                f"the deployment's client_cert is not presented on {call_type.value if call_type else 'unknown'} "
+                "calls, so the h2o_oauth token is not sent without it",
+                model,
+            )
         try:
             config: Final = OAuthConfig.model_validate(raw_config)
         except ValidationError as e:
